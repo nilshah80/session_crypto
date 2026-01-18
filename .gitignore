@@ -53,3 +53,5 @@ server-rust/Cargo.lock
 
 # Docker
 redis_data/
+target/rust-analyzer/flycheck0/stderr
+target/rust-analyzer/flycheck0/stdout

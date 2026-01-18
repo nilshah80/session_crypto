@@ -1,4 +1,4 @@
-use aws_lc_rs::{
+use ring::{
     aead::{self, Aad, BoundKey, Nonce, NonceSequence, NONCE_LEN},
     agreement::{self, EphemeralPrivateKey, UnparsedPublicKey},
     hkdf::{Salt, HKDF_SHA256},
@@ -87,11 +87,11 @@ impl SingleNonce {
 }
 
 impl NonceSequence for SingleNonce {
-    fn advance(&mut self) -> Result<Nonce, aws_lc_rs::error::Unspecified> {
+    fn advance(&mut self) -> Result<Nonce, ring::error::Unspecified> {
         self.nonce
             .take()
             .map(Nonce::assume_unique_for_key)
-            .ok_or(aws_lc_rs::error::Unspecified)
+            .ok_or(ring::error::Unspecified)
     }
 }
 
@@ -407,8 +407,7 @@ async fn init_session(
         agreement::agree_ephemeral(
             client_private_key,
             &server_public_key,
-            aws_lc_rs::error::Unspecified,
-            |secret| Ok::<Vec<u8>, aws_lc_rs::error::Unspecified>(secret.to_vec()),
+            |secret| secret.to_vec(),
         )
         .unwrap()
     });

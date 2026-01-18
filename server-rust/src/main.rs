@@ -5,7 +5,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use aws_lc_rs::{
+use ring::{
     aead::{self, Aad, BoundKey, Nonce, NonceSequence, NONCE_LEN},
     agreement::{self, EphemeralPrivateKey, UnparsedPublicKey},
     hkdf::{Salt, HKDF_SHA256},
@@ -140,11 +140,11 @@ impl MetricsCollector {
 struct SingleUseNonce(Option<[u8; NONCE_LEN]>);
 
 impl NonceSequence for SingleUseNonce {
-    fn advance(&mut self) -> Result<Nonce, aws_lc_rs::error::Unspecified> {
+    fn advance(&mut self) -> Result<Nonce, ring::error::Unspecified> {
         self.0
             .take()
             .map(Nonce::assume_unique_for_key)
-            .ok_or(aws_lc_rs::error::Unspecified)
+            .ok_or(ring::error::Unspecified)
     }
 }
 
@@ -281,7 +281,7 @@ fn aes_gcm_encrypt(
     iv: &[u8; 12],
     aad: &[u8],
     plaintext: &[u8],
-) -> Result<(Vec<u8>, Vec<u8>), aws_lc_rs::error::Unspecified> {
+) -> Result<(Vec<u8>, Vec<u8>), ring::error::Unspecified> {
     let unbound_key = aead::UnboundKey::new(&aead::AES_256_GCM, key)?;
     let mut sealing_key = aead::SealingKey::new(unbound_key, SingleUseNonce(Some(*iv)));
 
@@ -298,7 +298,7 @@ fn aes_gcm_decrypt(
     aad: &[u8],
     ciphertext: &[u8],
     tag: &[u8],
-) -> Result<Vec<u8>, aws_lc_rs::error::Unspecified> {
+) -> Result<Vec<u8>, ring::error::Unspecified> {
     let unbound_key = aead::UnboundKey::new(&aead::AES_256_GCM, key)?;
     let mut opening_key = aead::OpeningKey::new(unbound_key, SingleUseNonce(Some(*iv)));
 
@@ -474,8 +474,7 @@ async fn session_init_handler(
         agreement::agree_ephemeral(
             server_private_key,
             &client_public_key,
-            aws_lc_rs::error::Unspecified,
-            |secret| Ok::<Vec<u8>, aws_lc_rs::error::Unspecified>(secret.to_vec()),
+            |secret| secret.to_vec(),
         )
         .unwrap()
     });
