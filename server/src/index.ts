@@ -1,5 +1,6 @@
 import Fastify from "fastify";
 import crypto from "crypto";
+import { Redis } from "ioredis";
 import {
   b64,
   unb64,
@@ -7,23 +8,46 @@ import {
   hkdf32,
   validateP256PublicKey,
   validateReplayProtection,
+  initReplayProtection,
   aesGcmDecrypt,
   aesGcmEncrypt,
   buildAad,
   generateIv,
   generateSessionId,
 } from "./crypto-helpers.js";
-import { storeSession, getSession } from "./session-store.js";
+import { storeSession, getSession, initSessionStore } from "./session-store.js";
 
 const fastify = Fastify({
   logger: true,
 });
 
+// Initialize Redis connection
+const redis = new Redis({
+  host: process.env.REDIS_HOST || "localhost",
+  port: parseInt(process.env.REDIS_PORT || "6379", 10),
+  retryStrategy: (times) => {
+    const delay = Math.min(times * 50, 2000);
+    return delay;
+  },
+});
+
+redis.on("connect", () => {
+  console.log("Connected to Redis");
+});
+
+redis.on("error", (err) => {
+  console.error("Redis connection error:", err);
+});
+
+// Initialize stores with Redis
+initSessionStore(redis);
+initReplayProtection(redis);
+
 // Add content type parser for raw/octet-stream bodies
 fastify.addContentTypeParser(
   "application/octet-stream",
   { parseAs: "string" },
-  (req, body, done) => {
+  (_req, body, done) => {
     done(null, body);
   }
 );
@@ -58,7 +82,7 @@ fastify.post<{
 
   // Replay protection
   try {
-    validateReplayProtection(nonce, timestamp);
+    await validateReplayProtection(nonce, timestamp);
   } catch (e) {
     request.log.warn({ error: e }, "Replay protection failed");
     return reply.status(400).send({ error: "CRYPTO_ERROR" });
@@ -104,8 +128,8 @@ fastify.post<{
   const info = Buffer.from("SESSION|A256GCM|AUTH", "utf8");
   const sessionKey = hkdf32(sharedSecret, salt, info);
 
-  // Store session
-  storeSession(sessionId, sessionKey, "AUTH", allowedTtl);
+  // Store session in Redis
+  await storeSession(sessionId, sessionKey, "AUTH", allowedTtl);
 
   request.log.info({ sessionId, ttl: allowedTtl }, "Session created");
 
@@ -140,7 +164,7 @@ fastify.post("/transaction/purchase", async (request, reply) => {
 
   // Replay protection
   try {
-    validateReplayProtection(nonce, timestamp);
+    await validateReplayProtection(nonce, timestamp);
   } catch (e) {
     request.log.warn({ error: e }, "Replay protection failed");
     return reply.status(400).send({ error: "CRYPTO_ERROR" });
@@ -152,8 +176,8 @@ fastify.post("/transaction/purchase", async (request, reply) => {
     return reply.status(400).send({ error: "CRYPTO_ERROR" });
   }
 
-  // Get session from store
-  const session = getSession(sessionId);
+  // Get session from Redis store
+  const session = await getSession(sessionId);
   if (!session) {
     return reply.status(401).send({ error: "SESSION_EXPIRED" });
   }
@@ -254,14 +278,42 @@ fastify.post("/transaction/purchase", async (request, reply) => {
 
 // Health check
 fastify.get("/health", async () => {
-  return { status: "ok", timestamp: new Date().toISOString() };
+  // Check Redis connection
+  const redisStatus = redis.status === "ready" ? "ok" : "disconnected";
+  return {
+    status: redisStatus === "ok" ? "ok" : "degraded",
+    timestamp: new Date().toISOString(),
+    redis: redisStatus,
+  };
 });
+
+// Graceful shutdown
+const shutdown = async () => {
+  console.log("Shutting down...");
+  await redis.quit();
+  await fastify.close();
+  process.exit(0);
+};
+
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
 
 // Start server
 const start = async () => {
   try {
+    // Wait for Redis to be ready
+    await new Promise<void>((resolve, reject) => {
+      if (redis.status === "ready") {
+        resolve();
+        return;
+      }
+      redis.once("ready", resolve);
+      redis.once("error", reject);
+      setTimeout(() => reject(new Error("Redis connection timeout")), 10000);
+    });
+
     await fastify.listen({ port: 3000, host: "0.0.0.0" });
-    console.log("🚀 Server listening on http://localhost:3000");
+    console.log("Server listening on http://localhost:3000");
   } catch (err) {
     fastify.log.error(err);
     process.exit(1);

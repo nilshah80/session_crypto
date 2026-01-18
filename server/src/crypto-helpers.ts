@@ -1,4 +1,5 @@
 import crypto from "crypto";
+import { Redis } from "ioredis";
 
 // Base64 encoding/decoding helpers
 export const b64 = (buf: Buffer): string => buf.toString("base64");
@@ -95,15 +96,24 @@ export function validateP256PublicKey(publicKeyBytes: Buffer): void {
 
 // Replay protection constants
 const TIMESTAMP_WINDOW_MS = 5 * 60 * 1000; // ±5 minutes
-const NONCE_TTL_SEC = 300;
+const NONCE_TTL_SEC = 300; // 5 minutes
+const NONCE_PREFIX = "nonce:";
 
-// Validate replay protection (for PoC using in-memory Map, use Redis in production)
-const nonceStore = new Map<string, number>();
+let redis: Redis | null = null;
 
-export function validateReplayProtection(
+export function initReplayProtection(redisClient: Redis): void {
+  redis = redisClient;
+}
+
+// Validate replay protection using Redis
+export async function validateReplayProtection(
   nonce: string,
   timestamp: string
-): void {
+): Promise<void> {
+  if (!redis) {
+    throw new Error("Replay protection not initialized");
+  }
+
   const ts = parseInt(timestamp, 10);
   const now = Date.now();
 
@@ -112,19 +122,13 @@ export function validateReplayProtection(
     throw new Error("TIMESTAMP_INVALID");
   }
 
-  // 2. Nonce uniqueness check
-  const key = `nonce:${nonce}`;
-  if (nonceStore.has(key)) {
+  // 2. Nonce uniqueness (atomic check-and-set using Redis SET NX EX)
+  const key = `${NONCE_PREFIX}${nonce}`;
+  const wasSet = await redis.set(key, "1", "EX", NONCE_TTL_SEC, "NX");
+
+  if (!wasSet) {
     throw new Error("REPLAY_DETECTED");
   }
-
-  // Store nonce with expiry
-  nonceStore.set(key, now);
-
-  // Cleanup old nonces (simple implementation)
-  setTimeout(() => {
-    nonceStore.delete(key);
-  }, NONCE_TTL_SEC * 1000);
 }
 
 // Generate random IV (12 bytes for AES-GCM)
