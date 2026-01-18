@@ -7,7 +7,7 @@ A proof-of-concept implementation of the session-based encryption design using E
 ```
 ┌─────────────────┐         ┌─────────────────┐         ┌─────────────────┐
 │     Client      │         │     Server      │         │     Redis       │
-│  (Multi-lang)   │         │   (Fastify)     │         │   (Sessions)    │
+│  (Multi-lang)   │         │  (Multi-lang)   │         │   (Sessions)    │
 └────────┬────────┘         └────────┬────────┘         └────────┬────────┘
          │                           │                           │
          │  POST /session/init       │                           │
@@ -38,7 +38,8 @@ A proof-of-concept implementation of the session-based encryption design using E
 
 ## Prerequisites
 
-- **Server**: Node.js 20+, Docker (for Redis)
+- **Server** (any one): Node.js 20+, Go 1.25+, or Rust 1.92+
+- **Infrastructure**: Docker (for Redis)
 - **Clients** (any one):
   - Node.js 20+
   - .NET 10.0
@@ -54,15 +55,28 @@ A proof-of-concept implementation of the session-based encryption design using E
 docker compose up -d
 ```
 
-### 2. Start the Server
+### 2. Start a Server
+
+Choose any server implementation:
 
 ```bash
+# Node.js (Fastify)
 cd server
 npm install
 npm run dev
+
+# Go (Chi router)
+cd server-go
+go build -o server-go .
+./server-go
+
+# Rust (Axum)
+cd server-rust
+cargo build --release
+./target/release/session-crypto-server
 ```
 
-Server will start on `http://localhost:3000`
+All servers start on `http://localhost:3000`
 
 ### 3. Run a Client
 
@@ -107,6 +121,16 @@ cargo run
 | Rust | `client/rust/` | Rust 1.92 | Tokio async |
 
 All clients implement the same encryption flow and produce identical outputs.
+
+## Server Implementations
+
+| Language | Directory | Framework | Pattern |
+|----------|-----------|-----------|---------|
+| Node.js | `server/` | Fastify | Async/await |
+| Go | `server-go/` | Chi | Goroutines |
+| Rust | `server-rust/` | Axum | Tokio async |
+
+All servers implement identical endpoints and crypto operations.
 
 ## Endpoints
 
@@ -197,13 +221,20 @@ nonce:<uuid>       → "1"                                  TTL: 300s
 ```
 session_crypto/
 ├── docker-compose.yml          # Redis 8 container
-├── server/
+├── server/                     # Node.js server (Fastify)
 │   ├── src/
-│   │   ├── index.ts            # Fastify server with endpoints
+│   │   ├── index.ts            # Server with endpoints
 │   │   ├── crypto-helpers.ts   # ECDH, HKDF, AES-GCM, replay protection
-│   │   └── session-store.ts    # Redis session storage
+│   │   ├── session-store.ts    # Redis session storage
+│   │   └── metrics.ts          # Server-Timing header support
 │   ├── package.json
 │   └── tsconfig.json
+├── server-go/                  # Go server (Chi)
+│   ├── main.go                 # All-in-one server implementation
+│   └── go.mod
+├── server-rust/                # Rust server (Axum)
+│   ├── src/main.rs             # All-in-one server implementation
+│   └── Cargo.toml
 ├── client/
 │   ├── node/                   # Node.js reference client
 │   ├── dotnet/                 # .NET 10 client
@@ -278,88 +309,104 @@ dotnet run -- --benchmark 1000
 
 ### Benchmark Results
 
-All benchmarks run on local machine with Redis. Results at 1000 iterations (after 5 warmup):
+All benchmarks run on Apple M4 Max with local Redis. Results at 1000 iterations (after 5 warmup).
 
-#### Combined Flow Throughput (init + purchase)
+#### Server Comparison (Combined Flow Throughput in req/s)
 
-| Client | Throughput | Mean Latency | P50 | P95 | P99 |
-|--------|------------|--------------|-----|-----|-----|
-| Go | 781.1 req/s | 1.3ms | 1.2ms | 1.9ms | 2.5ms |
-| Rust | 576.2 req/s | 1.7ms | 1.6ms | 2.8ms | 3.6ms |
-| Node.js | 533.6 req/s | 1.9ms | 1.7ms | 2.6ms | 3.2ms |
-| .NET | 411.8 req/s | 2.4ms | 2.3ms | 3.9ms | 5.0ms |
-| Java Virtual Threads | 321.9 req/s | 3.1ms | 2.7ms | 5.2ms | 6.6ms |
-| Java WebFlux | 271.1 req/s | 3.7ms | 3.5ms | 5.4ms | 6.6ms |
+| Client \ Server | Node.js | Go | Rust |
+|-----------------|---------|-----|------|
+| **Go** | 768.5 | **945.3** | 923.4 |
+| **Rust** | 773.2 | 903.9 | **921.2** |
+| **Node.js** | 427.6 | 597.1 | **631.5** |
+| **.NET** | 362.3 | 464.3 | **521.9** |
+| **Java VT** | 330.0 | **404.8** | 330.3 |
+| **Java WebFlux** | 311.0 | **369.1** | 343.7 |
 
-#### /session/init Endpoint
+**Key Findings:**
+- Go server is fastest overall (~945 req/s with Go/Rust clients)
+- Rust server very close to Go (~921 req/s), best for Node.js/.NET clients
+- Go/Rust servers provide 20-48% improvement over Node.js server
 
-| Client | Throughput | Mean Latency | P50 | P95 | P99 |
-|--------|------------|--------------|-----|-----|-----|
-| Go | 1377.0 req/s | 0.7ms | 0.7ms | 0.9ms | 1.8ms |
-| Rust | 1021.4 req/s | 1.0ms | 0.9ms | 1.6ms | 2.1ms |
-| Node.js | 954.6 req/s | 1.0ms | 1.0ms | 1.6ms | 1.9ms |
-| .NET | 666.7 req/s | 1.5ms | 1.4ms | 2.3ms | 3.0ms |
-| Java Virtual Threads | 529.6 req/s | 1.9ms | 1.7ms | 3.1ms | 4.4ms |
-| Java WebFlux | 452.9 req/s | 2.2ms | 2.1ms | 3.3ms | 4.1ms |
+#### Detailed Results by Server
 
-#### /transaction/purchase Endpoint
+**Node.js Server (Fastify):**
 
-| Client | Throughput | Mean Latency | P50 | P95 | P99 |
-|--------|------------|--------------|-----|-----|-----|
-| Go | 1808.0 req/s | 0.6ms | 0.5ms | 0.7ms | 1.5ms |
-| Rust | 1323.2 req/s | 0.8ms | 0.7ms | 1.3ms | 2.0ms |
-| Node.js | 1212.3 req/s | 0.8ms | 0.8ms | 1.2ms | 1.9ms |
-| .NET | 1081.1 req/s | 0.9ms | 0.8ms | 1.7ms | 2.4ms |
-| Java Virtual Threads | 822.1 req/s | 1.2ms | 1.0ms | 2.3ms | 3.0ms |
-| Java WebFlux | 679.5 req/s | 1.5ms | 1.3ms | 2.4ms | 3.2ms |
+| Client | /session/init | /transaction/purchase | Combined |
+|--------|---------------|----------------------|----------|
+| Go | 1365.2 req/s | 1760.7 req/s | 768.5 req/s |
+| Rust | 1367.2 req/s | 1781.6 req/s | 773.2 req/s |
+| Node.js | 780.3 req/s | 947.7 req/s | 427.6 req/s |
+| .NET | 598.5 req/s | 920.9 req/s | 362.3 req/s |
+| Java VT | 543.5 req/s | 841.5 req/s | 330.0 req/s |
+| Java WebFlux | 510.4 req/s | 803.3 req/s | 311.0 req/s |
 
-#### Scaling Behavior (10000 iterations)
+**Go Server (Chi):**
 
-| Client | Combined Throughput | Combined Mean Latency | Combined P99 |
-|--------|---------------------|----------------------|--------------|
-| Go | 819.9 req/s | 1.2ms | 2.3ms |
-| Rust | 772.2 req/s | 1.3ms | 2.6ms |
-| Node.js | 553.6 req/s | 1.8ms | 4.7ms |
-| .NET | 425.1 req/s | 2.4ms | 5.6ms |
-| Java Virtual Threads | 294.3 req/s | 3.4ms | 6.4ms |
-| Java WebFlux | 290.6 req/s | 3.4ms | 6.4ms |
+| Client | /session/init | /transaction/purchase | Combined |
+|--------|---------------|----------------------|----------|
+| Go | 1775.6 req/s | 2024.9 req/s | **945.3 req/s** |
+| Rust | 1698.0 req/s | 1935.5 req/s | 903.9 req/s |
+| Node.js | 1128.7 req/s | 1270.1 req/s | 597.1 req/s |
+| .NET | 781.2 req/s | 1148.0 req/s | 464.3 req/s |
+| Java VT | 668.5 req/s | 1028.4 req/s | 404.8 req/s |
+| Java WebFlux | 616.6 req/s | 926.8 req/s | 369.1 req/s |
+
+**Rust Server (Axum):**
+
+| Client | /session/init | /transaction/purchase | Combined |
+|--------|---------------|----------------------|----------|
+| Go | 1721.9 req/s | 1994.4 req/s | 923.4 req/s |
+| Rust | 1711.9 req/s | 1997.4 req/s | **921.2 req/s** |
+| Node.js | 1191.1 req/s | 1346.4 req/s | 631.5 req/s |
+| .NET | 866.6 req/s | 1316.5 req/s | 521.9 req/s |
+| Java VT | 553.7 req/s | 819.6 req/s | 330.3 req/s |
+| Java WebFlux | 576.6 req/s | 856.7 req/s | 343.7 req/s |
+
+#### Server Speed Improvement vs Node.js
+
+| Client | Go Server | Rust Server |
+|--------|-----------|-------------|
+| Go | +23% | +20% |
+| Rust | +17% | +19% |
+| Node.js | +40% | +48% |
+| .NET | +28% | +44% |
+| Java VT | +23% | 0% |
+| Java WebFlux | +19% | +11% |
+
+#### Client Performance Ranking
+
+| Rank | Client | Best Throughput | Notes |
+|------|--------|-----------------|-------|
+| 1 | Go | 945.3 req/s | Fastest with Go server |
+| 2 | Rust | 921.2 req/s | Uses aws-lc-rs (AWS LibCrypto) |
+| 3 | Node.js | 631.5 req/s | Best with Rust server |
+| 4 | .NET | 521.9 req/s | Best with Rust server |
+| 5 | Java VT | 404.8 req/s | Best with Go server |
+| 6 | Java WebFlux | 369.1 req/s | Best with Go server |
 
 **Notes:**
-- Go and Rust show best performance (~800 req/s at 10k iterations)
-- Rust uses `aws-lc-rs` crate (AWS LibCrypto) for optimized crypto - within 6% of Go
-- Node.js follows at ~550 req/s at scale
-- .NET improved after HttpClient connection pooling fix (~425 req/s)
-- Go benefits from efficient goroutines and optimized crypto implementation
-- Java clients show consistent performance with JIT warmup
-- P99 tail latency stays under 6ms for all implementations
+- Go and Rust clients show nearly identical performance (~900-950 req/s)
+- Go server excels with Go/Rust clients due to efficient goroutines
+- Rust server provides best performance for Node.js and .NET clients
+- Java clients perform consistently across all servers (~300-400 req/s)
+- All implementations stay under 3ms P50 latency
 
-### Server Benchmarks
+#### Why Java Clients Are Slower
 
-Server-side performance measured using `wrk` and the fastest client (Go):
+Java crypto operations through JCA (Java Cryptography Architecture) are significantly slower than native implementations:
 
-#### Raw HTTP Performance (wrk)
+| Operation | Go | Java (JCA) | Slowdown |
+|-----------|-----|------------|----------|
+| ECDH keygen | 0.03ms | ~1ms* | ~33x |
+| ECDH compute | 0.04ms | ~1.3ms | ~32x |
+| AES-GCM | 0.002ms | ~0.3ms | ~150x |
 
-| Endpoint | Connections | Throughput | Mean Latency | Max Latency |
-|----------|-------------|------------|--------------|-------------|
-| /health | 100 | 52,091 req/s | 2.08ms | 119ms |
-| /session/init | 10 | 4,375 req/s | 2.28ms | 7.6ms |
-| /session/init | 50 | 5,073 req/s | 9.45ms | 30ms |
-| /session/init | 100 | 4,984 req/s | 20.9ms | 333ms |
+*First call ~16ms due to JIT warmup and provider initialization
 
-#### End-to-End Crypto Flow (Go client, 5000 iterations)
-
-| Endpoint | Throughput | Mean Latency | P50 | P95 | P99 |
-|----------|------------|--------------|-----|-----|-----|
-| /session/init | 1,416 req/s | 0.7ms | 0.7ms | 0.9ms | 1.7ms |
-| /transaction/purchase | 1,892 req/s | 0.5ms | 0.5ms | 0.7ms | 1.5ms |
-| Combined flow | 809 req/s | 1.2ms | 1.1ms | 1.9ms | 2.4ms |
-
-**Server Performance Notes:**
-- Raw HTTP baseline: ~52k req/s on /health (no crypto, no Redis)
-- Session init with ECDH + HKDF + Redis: ~5k req/s (10x overhead from crypto)
-- Encrypted transaction: ~1.9k req/s per client connection
-- Server can handle ~800 complete flows/second (init + encrypted request)
-- Bottleneck is ECDH key generation (~0.2ms per operation)
+This is a known limitation of JCA. For better Java crypto performance, consider:
+- Amazon Corretto Crypto Provider (ACCP) - native crypto for AWS environments
+- BouncyCastle with native provider
+- GraalVM native image compilation
 
 ## Development
 

@@ -43,10 +43,13 @@ client/java-*/target/
 
 # Go
 client/go/session-crypto-client
+server-go/server-go
 
 # Rust
 client/rust/target/
 client/rust/Cargo.lock
+server-rust/target/
+server-rust/Cargo.lock
 
 # Docker
 redis_data/

@@ -30,8 +30,12 @@ public class SessionCryptoClient {
     private static final String SERVER_URL = "http://localhost:3000";
     private static final ObjectMapper mapper = new ObjectMapper();
 
-    // Async HttpClient
+    // Shared SecureRandom instance (thread-safe, avoid getInstanceStrong per request)
+    private static final SecureRandom secureRandom = new SecureRandom();
+
+    // Async HttpClient with connection pooling
     private static final HttpClient httpClient = HttpClient.newBuilder()
+        .version(HttpClient.Version.HTTP_1_1)
         .build();
 
     // ===== Metrics Types =====
@@ -311,7 +315,7 @@ public class SessionCryptoClient {
 
                 // Generate IV and nonce
                 byte[] iv = new byte[12];
-                SecureRandom.getInstanceStrong().nextBytes(iv);
+                secureRandom.nextBytes(iv);
                 String nonce = UUID.randomUUID().toString();
                 String timestamp = String.valueOf(System.currentTimeMillis());
 
