@@ -16,6 +16,14 @@ import {
   generateSessionId,
 } from "./crypto-helpers.js";
 import { storeSession, getSession, initSessionStore } from "./session-store.js";
+import { MetricsCollector } from "./metrics.js";
+
+// Declare module augmentation for Fastify request
+declare module "fastify" {
+  interface FastifyRequest {
+    metrics?: MetricsCollector;
+  }
+}
 
 const fastify = Fastify({
   logger: true,
@@ -52,6 +60,24 @@ fastify.addContentTypeParser(
   }
 );
 
+// Metrics hooks - initialize collector on request start
+fastify.addHook("onRequest", async (request) => {
+  const endpoint = request.routeOptions?.url || request.url;
+  request.metrics = new MetricsCollector(endpoint);
+});
+
+// Add Server-Timing header on response
+fastify.addHook("onSend", async (request, reply) => {
+  if (request.metrics) {
+    const header = request.metrics.toServerTimingHeader();
+    reply.header("Server-Timing", header);
+
+    // Log metrics for debugging
+    const metrics = request.metrics.finalize();
+    request.log.info({ metrics }, "Request metrics");
+  }
+});
+
 // Types
 interface SessionInitBody {
   keyAgreement: string;
@@ -82,7 +108,9 @@ fastify.post<{
 
   // Replay protection
   try {
-    await validateReplayProtection(nonce, timestamp);
+    await request.metrics!.measureAsync("replay-protection", () =>
+      validateReplayProtection(nonce, timestamp)
+    );
   } catch (e) {
     request.log.warn({ error: e }, "Replay protection failed");
     return reply.status(400).send({ error: "CRYPTO_ERROR" });
@@ -102,18 +130,26 @@ fastify.post<{
   // Decode and validate client public key
   let clientPub: Buffer;
   try {
-    clientPub = unb64(clientPublicKey);
-    validateP256PublicKey(clientPub);
+    clientPub = request.metrics!.measure("validate-pubkey", () => {
+      const pub = unb64(clientPublicKey);
+      validateP256PublicKey(pub);
+      return pub;
+    });
   } catch (e) {
     request.log.warn({ error: e }, "Client public key validation failed");
     return reply.status(400).send({ error: "CRYPTO_ERROR" });
   }
 
   // Generate server ECDH keypair
-  const { ecdh: serverECDH, publicKey: serverPub } = createEcdhKeypair();
+  const { ecdh: serverECDH, publicKey: serverPub } = request.metrics!.measure(
+    "ecdh-keygen",
+    () => createEcdhKeypair()
+  );
 
   // Compute shared secret
-  const sharedSecret = serverECDH.computeSecret(clientPub);
+  const sharedSecret = request.metrics!.measure("ecdh-compute", () =>
+    serverECDH.computeSecret(clientPub)
+  );
 
   // Generate session ID with 128-bit entropy
   const sessionId = generateSessionId("S");
@@ -126,10 +162,14 @@ fastify.post<{
   // In production with APIM, you might pass principal info via headers
   const salt = Buffer.from(sessionId, "utf8");
   const info = Buffer.from("SESSION|A256GCM|AUTH", "utf8");
-  const sessionKey = hkdf32(sharedSecret, salt, info);
+  const sessionKey = request.metrics!.measure("hkdf", () =>
+    hkdf32(sharedSecret, salt, info)
+  );
 
   // Store session in Redis
-  await storeSession(sessionId, sessionKey, "AUTH", allowedTtl);
+  await request.metrics!.measureAsync("redis-store", () =>
+    storeSession(sessionId, sessionKey, "AUTH", allowedTtl)
+  );
 
   request.log.info({ sessionId, ttl: allowedTtl }, "Session created");
 
@@ -164,7 +204,9 @@ fastify.post("/transaction/purchase", async (request, reply) => {
 
   // Replay protection
   try {
-    await validateReplayProtection(nonce, timestamp);
+    await request.metrics!.measureAsync("replay-protection", () =>
+      validateReplayProtection(nonce, timestamp)
+    );
   } catch (e) {
     request.log.warn({ error: e }, "Replay protection failed");
     return reply.status(400).send({ error: "CRYPTO_ERROR" });
@@ -177,7 +219,9 @@ fastify.post("/transaction/purchase", async (request, reply) => {
   }
 
   // Get session from Redis store
-  const session = await getSession(sessionId);
+  const session = await request.metrics!.measureAsync("redis-get", () =>
+    getSession(sessionId)
+  );
   if (!session) {
     return reply.status(401).send({ error: "SESSION_EXPIRED" });
   }
@@ -203,7 +247,9 @@ fastify.post("/transaction/purchase", async (request, reply) => {
   }
 
   // Rebuild expected AAD and verify it matches
-  const expectedAad = buildAad("POST", "/transaction/purchase", timestamp, nonce, kid);
+  const expectedAad = request.metrics!.measure("aad-validation", () =>
+    buildAad("POST", "/transaction/purchase", timestamp, nonce, kid)
+  );
   if (!aad.equals(expectedAad)) {
     request.log.warn("AAD mismatch");
     return reply.status(400).send({ error: "CRYPTO_ERROR" });
@@ -212,7 +258,9 @@ fastify.post("/transaction/purchase", async (request, reply) => {
   // Decrypt request body
   let plaintext: Buffer;
   try {
-    plaintext = aesGcmDecrypt(session.key, iv, aad, ciphertext, tag);
+    plaintext = request.metrics!.measure("aes-gcm-decrypt", () =>
+      aesGcmDecrypt(session.key, iv, aad, ciphertext, tag)
+    );
   } catch (e) {
     request.log.warn({ error: e }, "Decryption failed");
     return reply.status(400).send({ error: "CRYPTO_ERROR" });
@@ -256,12 +304,10 @@ fastify.post("/transaction/purchase", async (request, reply) => {
     kid
   );
 
-  const { ciphertext: responseCiphertext, tag: responseTag } = aesGcmEncrypt(
-    session.key,
-    responseIv,
-    responseAad,
-    responsePlaintext
-  );
+  const { ciphertext: responseCiphertext, tag: responseTag } =
+    request.metrics!.measure("aes-gcm-encrypt", () =>
+      aesGcmEncrypt(session.key, responseIv, responseAad, responsePlaintext)
+    );
 
   // Set response headers
   reply.header("X-Kid", kid);

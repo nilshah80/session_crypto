@@ -27,3 +27,26 @@ npm-debug.log*
 # Test coverage
 coverage/
 .claude/
+
+# .NET
+client/dotnet/**/bin/
+client/dotnet/**/obj/
+*.user
+*.suo
+
+# Java
+client/java-*/out/
+client/java-*/lib/
+client/java-*/target/
+*.class
+*.jar
+
+# Go
+client/go/session-crypto-client
+
+# Rust
+client/rust/target/
+client/rust/Cargo.lock
+
+# Docker
+redis_data/
