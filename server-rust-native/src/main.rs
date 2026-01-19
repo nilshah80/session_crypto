@@ -5,12 +5,19 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use aws_lc_rs::{
-    aead::{self, Aad, BoundKey, Nonce, NonceSequence, NONCE_LEN},
-    agreement::{self, EphemeralPrivateKey, UnparsedPublicKey},
-    hkdf::{Salt, HKDF_SHA256},
-    rand::{SecureRandom, SystemRandom},
+// RustCrypto native crates
+use aes_gcm::{
+    aead::{Aead, KeyInit, Payload},
+    Aes256Gcm, Nonce,
 };
+use hkdf::Hkdf;
+use p256::{
+    ecdh::EphemeralSecret,
+    elliptic_curve::sec1::ToEncodedPoint,
+    PublicKey,
+};
+use sha2::Sha256;
+use rand::RngCore;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
@@ -34,7 +41,6 @@ const SESSION_PREFIX: &str = "sess:";
 // App state
 struct AppState {
     redis: Mutex<redis::aio::MultiplexedConnection>,
-    rng: SystemRandom,
 }
 
 // Types
@@ -138,19 +144,7 @@ impl MetricsCollector {
     }
 }
 
-// Helper for AES-GCM with a fixed nonce (used per-operation)
-struct SingleUseNonce(Option<[u8; NONCE_LEN]>);
-
-impl NonceSequence for SingleUseNonce {
-    fn advance(&mut self) -> Result<Nonce, aws_lc_rs::error::Unspecified> {
-        self.0
-            .take()
-            .map(Nonce::assume_unique_for_key)
-            .ok_or(aws_lc_rs::error::Unspecified)
-    }
-}
-
-// Crypto helpers
+// Crypto helpers using RustCrypto
 fn b64_encode(data: &[u8]) -> String {
     BASE64.encode(data)
 }
@@ -159,21 +153,21 @@ fn b64_decode(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
     BASE64.decode(s)
 }
 
-fn generate_session_id(prefix: &str, rng: &SystemRandom) -> String {
+fn generate_session_id(prefix: &str) -> String {
     let mut bytes = [0u8; 16];
-    rng.fill(&mut bytes).unwrap();
+    rand::thread_rng().fill_bytes(&mut bytes);
     format!("{}-{}", prefix, hex::encode(bytes))
 }
 
-fn generate_iv(rng: &SystemRandom) -> [u8; 12] {
+fn generate_iv() -> [u8; 12] {
     let mut iv = [0u8; 12];
-    rng.fill(&mut iv).unwrap();
+    rand::thread_rng().fill_bytes(&mut iv);
     iv
 }
 
-fn generate_random_hex(n: usize, rng: &SystemRandom) -> String {
+fn generate_random_hex(n: usize) -> String {
     let mut bytes = vec![0u8; n];
-    rng.fill(&mut bytes).unwrap();
+    rand::thread_rng().fill_bytes(&mut bytes);
     hex::encode(bytes)
 }
 
@@ -189,11 +183,9 @@ fn current_timestamp_iso() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis();
-    // Format as ISO 8601 with milliseconds
     let secs = now / 1000;
     let millis = now % 1000;
-    let naive = chrono_lite(secs as i64, millis as u32);
-    naive
+    chrono_lite(secs as i64, millis as u32)
 }
 
 // Simple ISO timestamp formatter without chrono dependency
@@ -210,7 +202,6 @@ fn chrono_lite(secs: i64, millis: u32) -> String {
         rem_secs = (SECS_PER_DAY as u32) - rem_secs;
     }
 
-    // Days since 1970-01-01 -> days since 0001-01-01
     days += 719468;
 
     let mut year = 1;
@@ -219,9 +210,7 @@ fn chrono_lite(secs: i64, millis: u32) -> String {
     days -= q * DAYS_PER_400Y;
 
     q = days / DAYS_PER_100Y;
-    if q == 4 {
-        q = 3;
-    }
+    if q == 4 { q = 3; }
     year += q * 100;
     days -= q * DAYS_PER_100Y;
 
@@ -230,9 +219,7 @@ fn chrono_lite(secs: i64, millis: u32) -> String {
     days -= q * DAYS_PER_4Y;
 
     q = days / 365;
-    if q == 4 {
-        q = 3;
-    }
+    if q == 4 { q = 3; }
     year += q;
     days -= q * 365;
 
@@ -264,62 +251,69 @@ fn chrono_lite(secs: i64, millis: u32) -> String {
     )
 }
 
-// HKDF to derive 32-byte key
+// HKDF using RustCrypto
 fn hkdf32(shared_secret: &[u8], salt_bytes: &[u8], info: &[u8]) -> Vec<u8> {
-    let salt = Salt::new(HKDF_SHA256, salt_bytes);
-    let prk = salt.extract(shared_secret);
-    let info_arr = [info];
-    let okm = prk
-        .expand(&info_arr, HKDF_SHA256)
-        .expect("HKDF expand failed");
-    let mut key = vec![0u8; 32];
-    okm.fill(&mut key).expect("HKDF fill failed");
-    key
+    let hk = Hkdf::<Sha256>::new(Some(salt_bytes), shared_secret);
+    let mut okm = vec![0u8; 32];
+    hk.expand(info, &mut okm).expect("HKDF expand failed");
+    okm
 }
 
-// AES-256-GCM encryption
+// AES-256-GCM encryption using RustCrypto
 fn aes_gcm_encrypt(
     key: &[u8],
     iv: &[u8; 12],
     aad: &[u8],
     plaintext: &[u8],
-) -> Result<(Vec<u8>, Vec<u8>), aws_lc_rs::error::Unspecified> {
-    let unbound_key = aead::UnboundKey::new(&aead::AES_256_GCM, key)?;
-    let mut sealing_key = aead::SealingKey::new(unbound_key, SingleUseNonce(Some(*iv)));
+) -> Result<(Vec<u8>, Vec<u8>), aes_gcm::Error> {
+    let cipher = Aes256Gcm::new_from_slice(key).expect("Invalid key length");
+    let nonce = Nonce::from_slice(iv);
 
-    let mut in_out = plaintext.to_vec();
-    let tag = sealing_key.seal_in_place_separate_tag(Aad::from(aad), &mut in_out)?;
+    let payload = Payload {
+        msg: plaintext,
+        aad,
+    };
 
-    Ok((in_out, tag.as_ref().to_vec()))
+    let ciphertext_with_tag = cipher.encrypt(nonce, payload)?;
+
+    // Split ciphertext and tag (tag is last 16 bytes)
+    let tag_start = ciphertext_with_tag.len() - 16;
+    let ciphertext = ciphertext_with_tag[..tag_start].to_vec();
+    let tag = ciphertext_with_tag[tag_start..].to_vec();
+
+    Ok((ciphertext, tag))
 }
 
-// AES-256-GCM decryption
+// AES-256-GCM decryption using RustCrypto
 fn aes_gcm_decrypt(
     key: &[u8],
     iv: &[u8; 12],
     aad: &[u8],
     ciphertext: &[u8],
     tag: &[u8],
-) -> Result<Vec<u8>, aws_lc_rs::error::Unspecified> {
-    let unbound_key = aead::UnboundKey::new(&aead::AES_256_GCM, key)?;
-    let mut opening_key = aead::OpeningKey::new(unbound_key, SingleUseNonce(Some(*iv)));
+) -> Result<Vec<u8>, aes_gcm::Error> {
+    let cipher = Aes256Gcm::new_from_slice(key).expect("Invalid key length");
+    let nonce = Nonce::from_slice(iv);
 
-    let mut in_out = Vec::with_capacity(ciphertext.len() + tag.len());
-    in_out.extend_from_slice(ciphertext);
-    in_out.extend_from_slice(tag);
+    // Combine ciphertext and tag
+    let mut ciphertext_with_tag = ciphertext.to_vec();
+    ciphertext_with_tag.extend_from_slice(tag);
 
-    let plaintext = opening_key.open_in_place(Aad::from(aad), &mut in_out)?;
-    Ok(plaintext.to_vec())
+    let payload = Payload {
+        msg: &ciphertext_with_tag,
+        aad,
+    };
+
+    cipher.decrypt(nonce, payload)
 }
 
 // Build AAD from request components
-// Format: TIMESTAMP|NONCE|KID|CLIENTID
 fn build_aad(ts: &str, nonce: &str, kid: &str, client_id: &str) -> Vec<u8> {
     format!("{}|{}|{}|{}", ts, nonce, kid, client_id).into_bytes()
 }
 
-// Validate P-256 public key
-fn validate_p256_public_key(public_key_bytes: &[u8]) -> Result<(), &'static str> {
+// Validate P-256 public key (65 bytes uncompressed format)
+fn validate_p256_public_key(public_key_bytes: &[u8]) -> Result<PublicKey, &'static str> {
     if public_key_bytes.len() != 65 {
         return Err("INVALID_KEY_LENGTH");
     }
@@ -328,9 +322,7 @@ fn validate_p256_public_key(public_key_bytes: &[u8]) -> Result<(), &'static str>
         return Err("INVALID_KEY_FORMAT");
     }
 
-    // Validate point is on curve by trying to create a public key
-    let _ = UnparsedPublicKey::new(&agreement::ECDH_P256, public_key_bytes);
-    Ok(())
+    PublicKey::from_sec1_bytes(public_key_bytes).map_err(|_| "INVALID_KEY")
 }
 
 // Replay protection
@@ -346,7 +338,6 @@ async fn validate_replay_protection(
         return Err("TIMESTAMP_INVALID");
     }
 
-    // Nonce uniqueness check with Redis SET NX EX
     let key = format!("{}{}", NONCE_PREFIX, nonce);
     let was_set: bool = redis::cmd("SET")
         .arg(&key)
@@ -398,7 +389,6 @@ async fn get_session(
     let value = value?;
     let data: SessionData = serde_json::from_str(&value).ok()?;
 
-    // Double-check expiry
     if current_timestamp_ms() > data.expires_at {
         let _: Result<(), _> = redis.del::<_, ()>(&redis_key).await;
         return None;
@@ -415,18 +405,9 @@ async fn session_init_handler(
 ) -> impl IntoResponse {
     let mut metrics = MetricsCollector::new();
 
-    let nonce = headers
-        .get("x-nonce")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let timestamp = headers
-        .get("x-timestamp")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let client_id = headers
-        .get("x-clientid")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+    let nonce = headers.get("x-nonce").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let timestamp = headers.get("x-timestamp").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let client_id = headers.get("x-clientid").and_then(|v| v.to_str().ok()).unwrap_or("");
 
     if nonce.is_empty() || timestamp.is_empty() || client_id.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "CRYPTO_ERROR", &metrics);
@@ -452,48 +433,41 @@ async fn session_init_handler(
     }
 
     // Decode and validate client public key
-    let client_pub = match metrics.measure("validate-pubkey", || {
+    let client_pub_key = match metrics.measure("validate-pubkey", || {
         let pub_bytes = b64_decode(&req.client_public_key)?;
-        validate_p256_public_key(&pub_bytes).map_err(|_| base64::DecodeError::InvalidLength(0))?;
-        Ok::<Vec<u8>, base64::DecodeError>(pub_bytes)
+        validate_p256_public_key(&pub_bytes).map_err(|_| base64::DecodeError::InvalidLength(0))
     }) {
-        Ok(pub_bytes) => pub_bytes,
+        Ok(pk) => pk,
         Err(_) => {
             warn!("Client public key validation failed");
             return error_response(StatusCode::BAD_REQUEST, "CRYPTO_ERROR", &metrics);
         }
     };
 
-    // Generate server ECDH keypair
-    let server_private_key: EphemeralPrivateKey = metrics.measure("ecdh-keygen", || {
-        EphemeralPrivateKey::generate(&agreement::ECDH_P256, &state.rng).unwrap()
+    // Generate server ECDH keypair using p256 crate
+    let server_secret = metrics.measure("ecdh-keygen", || {
+        EphemeralSecret::random(&mut rand::thread_rng())
     });
-    let server_pub = server_private_key.compute_public_key().unwrap();
-    let server_pub_bytes = server_pub.as_ref().to_vec();
+    let server_public = p256::PublicKey::from(&server_secret);
+    let server_pub_bytes = server_public.to_encoded_point(false).as_bytes().to_vec();
 
-    // Compute shared secret
-    let client_public_key = UnparsedPublicKey::new(&agreement::ECDH_P256, &client_pub);
-    let shared_secret: Vec<u8> = metrics.measure("ecdh-compute", || {
-        agreement::agree_ephemeral(
-            server_private_key,
-            &client_public_key,
-            aws_lc_rs::error::Unspecified,
-            |secret: &[u8]| Ok::<_, aws_lc_rs::error::Unspecified>(secret.to_vec()),
-        )
-        .unwrap()
+    // Compute shared secret using ECDH
+    let shared_secret = metrics.measure("ecdh-compute", || {
+        server_secret.diffie_hellman(&client_pub_key)
     });
 
     // Generate session ID
-    let session_id = generate_session_id("S", &state.rng);
+    let session_id = generate_session_id("S");
 
     // Cap TTL between 5 minutes and 1 hour
     let ttl_sec = req.ttl_sec.unwrap_or(1800).clamp(300, 3600);
 
     // Derive session key using HKDF
-    // Info includes client_id for domain separation
     let salt = session_id.as_bytes();
     let info = format!("SESSION|A256GCM|{}", client_id);
-    let session_key = metrics.measure("hkdf", || hkdf32(&shared_secret, salt, info.as_bytes()));
+    let session_key = metrics.measure("hkdf", || {
+        hkdf32(shared_secret.raw_secret_bytes().as_slice(), salt, info.as_bytes())
+    });
 
     // Store session in Redis
     {
@@ -506,11 +480,7 @@ async fn session_init_handler(
 
         if let Err(e) = result {
             warn!("Failed to store session: {:?}", e);
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                &metrics,
-            );
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &metrics);
         }
     }
 
@@ -533,48 +503,17 @@ async fn transaction_purchase_handler(
 ) -> impl IntoResponse {
     let mut metrics = MetricsCollector::new();
 
-    // Extract encryption headers
-    let kid = headers
-        .get("x-kid")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let enc_alg = headers
-        .get("x-enc-alg")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let iv_b64 = headers
-        .get("x-iv")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let tag_b64 = headers
-        .get("x-tag")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let aad_b64 = headers
-        .get("x-aad")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let nonce = headers
-        .get("x-nonce")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let timestamp = headers
-        .get("x-timestamp")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let client_id = headers
-        .get("x-clientid")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+    let kid = headers.get("x-kid").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let enc_alg = headers.get("x-enc-alg").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let iv_b64 = headers.get("x-iv").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let tag_b64 = headers.get("x-tag").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let aad_b64 = headers.get("x-aad").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let nonce = headers.get("x-nonce").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let timestamp = headers.get("x-timestamp").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let client_id = headers.get("x-clientid").and_then(|v| v.to_str().ok()).unwrap_or("");
 
-    if kid.is_empty()
-        || enc_alg.is_empty()
-        || iv_b64.is_empty()
-        || tag_b64.is_empty()
-        || aad_b64.is_empty()
-        || nonce.is_empty()
-        || timestamp.is_empty()
-        || client_id.is_empty()
+    if kid.is_empty() || enc_alg.is_empty() || iv_b64.is_empty() || tag_b64.is_empty()
+        || aad_b64.is_empty() || nonce.is_empty() || timestamp.is_empty() || client_id.is_empty()
     {
         return error_response(StatusCode::BAD_REQUEST, "CRYPTO_ERROR", &metrics);
     }
@@ -598,14 +537,12 @@ async fn transaction_purchase_handler(
         }
     }
 
-    // Extract session ID from kid
     let session_id = if kid.starts_with("session:") {
         &kid[8..]
     } else {
         return error_response(StatusCode::BAD_REQUEST, "CRYPTO_ERROR", &metrics);
     };
 
-    // Get session from Redis
     let session = {
         let mut redis = state.redis.lock().await;
         metrics
@@ -615,12 +552,9 @@ async fn transaction_purchase_handler(
 
     let session = match session {
         Some(s) => s,
-        None => {
-            return error_response(StatusCode::UNAUTHORIZED, "SESSION_EXPIRED", &metrics);
-        }
+        None => return error_response(StatusCode::UNAUTHORIZED, "SESSION_EXPIRED", &metrics),
     };
 
-    // Decode crypto components
     let iv = match b64_decode(iv_b64) {
         Ok(v) if v.len() == 12 => v,
         _ => return error_response(StatusCode::BAD_REQUEST, "CRYPTO_ERROR", &metrics),
@@ -641,23 +575,18 @@ async fn transaction_purchase_handler(
         Err(_) => return error_response(StatusCode::BAD_REQUEST, "CRYPTO_ERROR", &metrics),
     };
 
-    // Rebuild expected AAD and verify
-    // AAD format: TIMESTAMP|NONCE|KID|CLIENTID
-    let expected_aad =
-        metrics.measure("aad-validation", || build_aad(timestamp, nonce, kid, client_id));
+    let expected_aad = metrics.measure("aad-validation", || build_aad(timestamp, nonce, kid, client_id));
 
     if aad != expected_aad {
         warn!("AAD mismatch");
         return error_response(StatusCode::BAD_REQUEST, "CRYPTO_ERROR", &metrics);
     }
 
-    // Decode session key
     let session_key = match b64_decode(&session.key) {
         Ok(v) => v,
         Err(_) => return error_response(StatusCode::BAD_REQUEST, "CRYPTO_ERROR", &metrics),
     };
 
-    // Decrypt request body
     let iv_array: [u8; 12] = iv.try_into().unwrap();
     let plaintext = match metrics.measure("aes-gcm-decrypt", || {
         aes_gcm_decrypt(&session_key, &iv_array, &aad, &ciphertext, &tag)
@@ -669,7 +598,6 @@ async fn transaction_purchase_handler(
         }
     };
 
-    // Parse decrypted JSON
     let request_data: TransactionRequest = match serde_json::from_slice(&plaintext) {
         Ok(d) => d,
         Err(_) => {
@@ -680,10 +608,9 @@ async fn transaction_purchase_handler(
 
     info!("Decrypted request: {:?}", request_data);
 
-    // Business logic - process transaction
     let response_data = TransactionResponse {
         status: "SUCCESS".to_string(),
-        transaction_id: format!("TXN-{}", generate_random_hex(8, &state.rng).to_uppercase()),
+        transaction_id: format!("TXN-{}", generate_random_hex(8).to_uppercase()),
         scheme_code: request_data.scheme_code.clone(),
         amount: request_data.amount,
         timestamp: current_timestamp_iso(),
@@ -693,49 +620,27 @@ async fn transaction_purchase_handler(
         ),
     };
 
-    // Encrypt response
     let response_plaintext = serde_json::to_vec(&response_data).unwrap();
-    let response_iv = generate_iv(&state.rng);
+    let response_iv = generate_iv();
     let response_nonce = uuid::Uuid::new_v4().to_string();
     let response_timestamp = current_timestamp_ms().to_string();
 
-    // Build response AAD
-    // AAD format: TIMESTAMP|NONCE|KID|CLIENTID
     let response_aad = build_aad(&response_timestamp, &response_nonce, kid, client_id);
 
     let (response_ciphertext, response_tag) = metrics.measure("aes-gcm-encrypt", || {
         aes_gcm_encrypt(&session_key, &response_iv, &response_aad, &response_plaintext).unwrap()
     });
 
-    // Build response with headers
     let mut response_headers = HeaderMap::new();
     response_headers.insert("X-Kid", HeaderValue::from_str(kid).unwrap());
     response_headers.insert("X-Enc-Alg", HeaderValue::from_static("A256GCM"));
-    response_headers.insert(
-        "X-IV",
-        HeaderValue::from_str(&b64_encode(&response_iv)).unwrap(),
-    );
-    response_headers.insert(
-        "X-Tag",
-        HeaderValue::from_str(&b64_encode(&response_tag)).unwrap(),
-    );
-    response_headers.insert(
-        "X-AAD",
-        HeaderValue::from_str(&b64_encode(&response_aad)).unwrap(),
-    );
-    response_headers.insert(
-        "X-Nonce",
-        HeaderValue::from_str(&response_nonce).unwrap(),
-    );
-    response_headers.insert(
-        "X-Timestamp",
-        HeaderValue::from_str(&response_timestamp).unwrap(),
-    );
+    response_headers.insert("X-IV", HeaderValue::from_str(&b64_encode(&response_iv)).unwrap());
+    response_headers.insert("X-Tag", HeaderValue::from_str(&b64_encode(&response_tag)).unwrap());
+    response_headers.insert("X-AAD", HeaderValue::from_str(&b64_encode(&response_aad)).unwrap());
+    response_headers.insert("X-Nonce", HeaderValue::from_str(&response_nonce).unwrap());
+    response_headers.insert("X-Timestamp", HeaderValue::from_str(&response_timestamp).unwrap());
     response_headers.insert("Content-Type", HeaderValue::from_static("application/octet-stream"));
-    response_headers.insert(
-        "Server-Timing",
-        HeaderValue::from_str(&metrics.to_server_timing_header()).unwrap(),
-    );
+    response_headers.insert("Server-Timing", HeaderValue::from_str(&metrics.to_server_timing_header()).unwrap());
 
     (StatusCode::OK, response_headers, b64_encode(&response_ciphertext)).into_response()
 }
@@ -743,20 +648,13 @@ async fn transaction_purchase_handler(
 async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let redis_status = {
         let mut redis = state.redis.lock().await;
-        match redis::cmd("PING")
-            .query_async::<String>(&mut *redis)
-            .await
-        {
+        match redis::cmd("PING").query_async::<String>(&mut *redis).await {
             Ok(_) => "ok",
             Err(_) => "disconnected",
         }
     };
 
-    let status = if redis_status == "ok" {
-        "ok"
-    } else {
-        "degraded"
-    };
+    let status = if redis_status == "ok" { "ok" } else { "degraded" };
 
     Json(HealthResponse {
         status: status.to_string(),
@@ -765,53 +663,34 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
     })
 }
 
-// Response helpers
 fn error_response(status: StatusCode, message: &str, metrics: &MetricsCollector) -> Response {
     let mut headers = HeaderMap::new();
     headers.insert("Content-Type", HeaderValue::from_static("application/json"));
-    headers.insert(
-        "Server-Timing",
-        HeaderValue::from_str(&metrics.to_server_timing_header()).unwrap(),
-    );
+    headers.insert("Server-Timing", HeaderValue::from_str(&metrics.to_server_timing_header()).unwrap());
 
-    let body = serde_json::to_string(&ErrorResponse {
-        error: message.to_string(),
-    })
-    .unwrap();
-
+    let body = serde_json::to_string(&ErrorResponse { error: message.to_string() }).unwrap();
     (status, headers, body).into_response()
 }
 
-fn success_response<T: Serialize>(
-    status: StatusCode,
-    data: T,
-    metrics: &MetricsCollector,
-) -> Response {
+fn success_response<T: Serialize>(status: StatusCode, data: T, metrics: &MetricsCollector) -> Response {
     let mut headers = HeaderMap::new();
     headers.insert("Content-Type", HeaderValue::from_static("application/json"));
-    headers.insert(
-        "Server-Timing",
-        HeaderValue::from_str(&metrics.to_server_timing_header()).unwrap(),
-    );
+    headers.insert("Server-Timing", HeaderValue::from_str(&metrics.to_server_timing_header()).unwrap());
 
     let body = serde_json::to_string(&data).unwrap();
-
     (status, headers, body).into_response()
 }
 
 #[tokio::main]
 async fn main() {
-    // Initialize tracing
     tracing_subscriber::fmt::init();
 
-    // Initialize Redis
     let redis_host = std::env::var("REDIS_HOST").unwrap_or_else(|_| "localhost".to_string());
     let redis_port = std::env::var("REDIS_PORT").unwrap_or_else(|_| "6379".to_string());
     let redis_url = format!("redis://{}:{}", redis_host, redis_port);
 
     let client = redis::Client::open(redis_url).expect("Failed to create Redis client");
 
-    // Wait for Redis to be ready
     let mut conn = None;
     for i in 0..10 {
         match client.get_multiplexed_async_connection().await {
@@ -831,10 +710,8 @@ async fn main() {
 
     let state = Arc::new(AppState {
         redis: Mutex::new(conn),
-        rng: SystemRandom::new(),
     });
 
-    // CORS configuration for browser clients
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
@@ -858,7 +735,6 @@ async fn main() {
             "x-aad".parse().unwrap(),
         ]);
 
-    // Build router
     let app = Router::new()
         .route("/session/init", post(session_init_handler))
         .route("/transaction/purchase", post(transaction_purchase_handler))
@@ -867,9 +743,8 @@ async fn main() {
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
-    // Start server
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    info!("Server listening on http://localhost:3000");
+    info!("Server listening on http://localhost:3000 (RustCrypto native)");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
