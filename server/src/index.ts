@@ -1,4 +1,5 @@
 import Fastify from "fastify";
+import cors from "@fastify/cors";
 import crypto from "crypto";
 import { Redis } from "ioredis";
 import {
@@ -50,6 +51,31 @@ redis.on("error", (err) => {
 // Initialize stores with Redis
 initSessionStore(redis);
 initReplayProtection(redis);
+
+// Enable CORS for browser clients (must be registered before routes)
+await fastify.register(cors, {
+  origin: true, // Allow all origins in development
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: [
+    "Content-Type",
+    "X-Nonce",
+    "X-Timestamp",
+    "X-ClientId",
+    "X-Kid",
+    "X-Enc-Alg",
+    "X-IV",
+    "X-Tag",
+    "X-AAD",
+  ],
+  exposedHeaders: [
+    "Server-Timing",
+    "X-Kid",
+    "X-Enc-Alg",
+    "X-IV",
+    "X-Tag",
+    "X-AAD",
+  ],
+});
 
 // Add content type parser for raw/octet-stream bodies
 fastify.addContentTypeParser(

@@ -107,9 +107,23 @@ go run .
 # Rust
 cd client/rust
 cargo run
+
+# Angular SPA (browser)
+cd client/angular-spa
+npm install
+npm start
+# Open http://localhost:4200
+
+# React SPA (browser)
+cd client/react-spa
+npm install
+npm start
+# Open http://localhost:4201
 ```
 
 ## Client Implementations
+
+### CLI Clients
 
 | Language | Directory | Version | Pattern |
 |----------|-----------|---------|---------|
@@ -119,6 +133,13 @@ cargo run
 | Java | `client/java-webflux/` | Java 25 | CompletableFuture |
 | Go | `client/go/` | Go 1.25 | Goroutines |
 | Rust | `client/rust/` | Rust 1.92 | Tokio async |
+
+### Browser SPA Clients
+
+| Framework | Directory | Version | Notes |
+|-----------|-----------|---------|-------|
+| Angular | `client/angular-spa/` | Angular 19 | Single-SPA, Web Crypto API |
+| React | `client/react-spa/` | React 19 | Single-SPA, Web Crypto API |
 
 All clients implement the same encryption flow and produce identical outputs.
 
@@ -141,11 +162,11 @@ Initialize an authenticated encryption session.
 **Headers:**
 - `X-Nonce: <uuid>` - Unique request nonce
 - `X-Timestamp: <epoch_ms>` - Request timestamp
+- `X-ClientId: <client_id>` - Client identifier (e.g., `NODE_CLI_CLIENT`, `ANGULAR_SPA_CLIENT`)
 
 **Request Body:**
 ```json
 {
-  "keyAgreement": "ECDH_P256",
   "clientPublicKey": "<base64>",
   "ttlSec": 1800
 }
@@ -173,6 +194,7 @@ Encrypted business endpoint for testing.
 - `X-AAD: <base64>`
 - `X-Nonce: <uuid>`
 - `X-Timestamp: <epoch_ms>`
+- `X-ClientId: <client_id>`
 
 **Request Body:** Base64-encoded ciphertext
 
@@ -195,10 +217,12 @@ Health check endpoint.
 
 - **Key Agreement:** ECDH with P-256 curve
 - **Key Derivation:** HKDF-SHA256
+  - Salt: Session ID
+  - Info: `SESSION|A256GCM|<clientId>`
 - **Encryption:** AES-256-GCM
 - **IV:** 12 bytes (96 bits), randomly generated per message
 - **Auth Tag:** 16 bytes (128 bits)
-- **AAD Format:** `METHOD|PATH|TIMESTAMP|NONCE|KID`
+- **AAD Format:** `TIMESTAMP|NONCE|KID|CLIENTID`
 
 ## Security Features
 
@@ -241,8 +265,9 @@ session_crypto/
 │   ├── java-virtual-threads/   # Java 25 with Virtual Threads
 │   ├── java-webflux/           # Java 25 with CompletableFuture
 │   ├── go/                     # Go 1.25 client
-│   └── rust/                   # Rust 1.92 client
-├── session-init-design.md      # Full design document
+│   ├── rust/                   # Rust 1.92 client
+│   ├── angular-spa/            # Angular 19 browser client
+│   └── react-spa/              # React 19 browser client
 └── README.md
 ```
 
