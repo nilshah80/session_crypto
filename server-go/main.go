@@ -628,6 +628,23 @@ func sendError(w http.ResponseWriter, status int, message string) {
 	sendJSON(w, status, ErrorResponse{Error: message})
 }
 
+// CORS middleware for browser clients
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Nonce, X-Timestamp, X-ClientId, X-Kid, X-Enc-Alg, X-IV, X-Tag, X-AAD")
+		w.Header().Set("Access-Control-Expose-Headers", "Server-Timing, X-Kid, X-Enc-Alg, X-IV, X-Tag, X-AAD")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
 func main() {
 	// Initialize Redis
 	redisHost := os.Getenv("REDIS_HOST")
@@ -657,6 +674,7 @@ func main() {
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
+	r.Use(corsMiddleware)
 
 	// Routes
 	r.Post("/session/init", sessionInitHandler)

@@ -19,7 +19,10 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Mutex;
-use tower_http::trace::TraceLayer;
+use tower_http::{
+    cors::{Any, CorsLayer},
+    trace::TraceLayer,
+};
 use tracing::{info, warn};
 
 // Constants
@@ -830,11 +833,36 @@ async fn main() {
         rng: SystemRandom::new(),
     });
 
+    // CORS configuration for browser clients
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers([
+            "content-type".parse().unwrap(),
+            "x-nonce".parse().unwrap(),
+            "x-timestamp".parse().unwrap(),
+            "x-clientid".parse().unwrap(),
+            "x-kid".parse().unwrap(),
+            "x-enc-alg".parse().unwrap(),
+            "x-iv".parse().unwrap(),
+            "x-tag".parse().unwrap(),
+            "x-aad".parse().unwrap(),
+        ])
+        .expose_headers([
+            "server-timing".parse().unwrap(),
+            "x-kid".parse().unwrap(),
+            "x-enc-alg".parse().unwrap(),
+            "x-iv".parse().unwrap(),
+            "x-tag".parse().unwrap(),
+            "x-aad".parse().unwrap(),
+        ]);
+
     // Build router
     let app = Router::new()
         .route("/session/init", post(session_init_handler))
         .route("/transaction/purchase", post(transaction_purchase_handler))
         .route("/health", get(health_handler))
+        .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
