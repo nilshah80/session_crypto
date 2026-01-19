@@ -43,7 +43,6 @@ const (
 
 // Types
 type SessionInitRequest struct {
-	KeyAgreement    string `json:"keyAgreement"`
 	ClientPublicKey string `json:"clientPublicKey"`
 	TTLSec          *int   `json:"ttlSec,omitempty"`
 }
@@ -215,8 +214,9 @@ func aesGcmDecrypt(key, iv, aad, ciphertext, tag []byte) ([]byte, error) {
 }
 
 // Build AAD from request components
-func buildAAD(method, path, ts, nonce, kid string) []byte {
-	return []byte(fmt.Sprintf("%s|%s|%s|%s|%s", method, path, ts, nonce, kid))
+// Format: TIMESTAMP|NONCE|KID|CLIENTID
+func buildAAD(ts, nonce, kid, clientId string) []byte {
+	return []byte(fmt.Sprintf("%s|%s|%s|%s", ts, nonce, kid, clientId))
 }
 
 // Validate P-256 public key is on curve
@@ -315,8 +315,9 @@ func sessionInitHandler(w http.ResponseWriter, r *http.Request) {
 
 	nonce := r.Header.Get("X-Nonce")
 	timestamp := r.Header.Get("X-Timestamp")
+	clientId := r.Header.Get("X-ClientId")
 
-	if nonce == "" || timestamp == "" {
+	if nonce == "" || timestamp == "" || clientId == "" {
 		sendError(w, http.StatusBadRequest, "CRYPTO_ERROR")
 		return
 	}
@@ -336,11 +337,6 @@ func sessionInitHandler(w http.ResponseWriter, r *http.Request) {
 	// Parse request body
 	var req SessionInitRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		sendError(w, http.StatusBadRequest, "CRYPTO_ERROR")
-		return
-	}
-
-	if req.KeyAgreement != "ECDH_P256" {
 		sendError(w, http.StatusBadRequest, "CRYPTO_ERROR")
 		return
 	}
@@ -402,8 +398,9 @@ func sessionInitHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Derive session key using HKDF
+	// Info includes clientId for domain separation
 	salt := []byte(sessionID)
-	info := []byte("SESSION|A256GCM|AUTH")
+	info := []byte(fmt.Sprintf("SESSION|A256GCM|%s", clientId))
 	var sessionKey []byte
 	metrics.Measure("hkdf", func() {
 		sessionKey, _ = hkdf32(sharedSecret, salt, info)
@@ -445,8 +442,9 @@ func transactionPurchaseHandler(w http.ResponseWriter, r *http.Request) {
 	aadB64 := r.Header.Get("X-AAD")
 	nonce := r.Header.Get("X-Nonce")
 	timestamp := r.Header.Get("X-Timestamp")
+	clientId := r.Header.Get("X-ClientId")
 
-	if kid == "" || encAlg == "" || ivB64 == "" || tagB64 == "" || aadB64 == "" || nonce == "" || timestamp == "" {
+	if kid == "" || encAlg == "" || ivB64 == "" || tagB64 == "" || aadB64 == "" || nonce == "" || timestamp == "" || clientId == "" {
 		sendError(w, http.StatusBadRequest, "CRYPTO_ERROR")
 		return
 	}
@@ -522,9 +520,10 @@ func transactionPurchaseHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Rebuild expected AAD and verify
+	// AAD format: TIMESTAMP|NONCE|KID|CLIENTID
 	var expectedAAD []byte
 	metrics.Measure("aad-validation", func() {
-		expectedAAD = buildAAD("POST", "/transaction/purchase", timestamp, nonce, kid)
+		expectedAAD = buildAAD(timestamp, nonce, kid, clientId)
 	})
 	if string(aad) != string(expectedAAD) {
 		log.Printf("AAD mismatch")
@@ -579,7 +578,8 @@ func transactionPurchaseHandler(w http.ResponseWriter, r *http.Request) {
 	responseTimestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
 
 	// Build response AAD
-	responseAAD := buildAAD("200", "/transaction/purchase", responseTimestamp, responseNonce, kid)
+	// AAD format: TIMESTAMP|NONCE|KID|CLIENTID
+	responseAAD := buildAAD(responseTimestamp, responseNonce, kid, clientId)
 
 	var responseCiphertext, responseTag []byte
 	metrics.Measure("aes-gcm-encrypt", func() {

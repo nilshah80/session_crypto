@@ -38,7 +38,6 @@ struct AppState {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionInitRequest {
-    key_agreement: String,
     client_public_key: String,
     ttl_sec: Option<i32>,
 }
@@ -311,8 +310,9 @@ fn aes_gcm_decrypt(
 }
 
 // Build AAD from request components
-fn build_aad(method: &str, path: &str, ts: &str, nonce: &str, kid: &str) -> Vec<u8> {
-    format!("{}|{}|{}|{}|{}", method, path, ts, nonce, kid).into_bytes()
+// Format: TIMESTAMP|NONCE|KID|CLIENTID
+fn build_aad(ts: &str, nonce: &str, kid: &str, client_id: &str) -> Vec<u8> {
+    format!("{}|{}|{}|{}", ts, nonce, kid, client_id).into_bytes()
 }
 
 // Validate P-256 public key
@@ -420,8 +420,12 @@ async fn session_init_handler(
         .get("x-timestamp")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
+    let client_id = headers
+        .get("x-clientid")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
 
-    if nonce.is_empty() || timestamp.is_empty() {
+    if nonce.is_empty() || timestamp.is_empty() || client_id.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "CRYPTO_ERROR", &metrics);
     }
 
@@ -438,10 +442,6 @@ async fn session_init_handler(
             warn!("Replay protection failed: {}", e);
             return error_response(StatusCode::BAD_REQUEST, "CRYPTO_ERROR", &metrics);
         }
-    }
-
-    if req.key_agreement != "ECDH_P256" {
-        return error_response(StatusCode::BAD_REQUEST, "CRYPTO_ERROR", &metrics);
     }
 
     if req.client_public_key.is_empty() {
@@ -486,9 +486,10 @@ async fn session_init_handler(
     let ttl_sec = req.ttl_sec.unwrap_or(1800).clamp(300, 3600);
 
     // Derive session key using HKDF
+    // Info includes client_id for domain separation
     let salt = session_id.as_bytes();
-    let info = b"SESSION|A256GCM|AUTH";
-    let session_key = metrics.measure("hkdf", || hkdf32(&shared_secret, salt, info));
+    let info = format!("SESSION|A256GCM|{}", client_id);
+    let session_key = metrics.measure("hkdf", || hkdf32(&shared_secret, salt, info.as_bytes()));
 
     // Store session in Redis
     {
@@ -557,6 +558,10 @@ async fn transaction_purchase_handler(
         .get("x-timestamp")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
+    let client_id = headers
+        .get("x-clientid")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
 
     if kid.is_empty()
         || enc_alg.is_empty()
@@ -565,6 +570,7 @@ async fn transaction_purchase_handler(
         || aad_b64.is_empty()
         || nonce.is_empty()
         || timestamp.is_empty()
+        || client_id.is_empty()
     {
         return error_response(StatusCode::BAD_REQUEST, "CRYPTO_ERROR", &metrics);
     }
@@ -632,8 +638,9 @@ async fn transaction_purchase_handler(
     };
 
     // Rebuild expected AAD and verify
+    // AAD format: TIMESTAMP|NONCE|KID|CLIENTID
     let expected_aad =
-        metrics.measure("aad-validation", || build_aad("POST", "/transaction/purchase", timestamp, nonce, kid));
+        metrics.measure("aad-validation", || build_aad(timestamp, nonce, kid, client_id));
 
     if aad != expected_aad {
         warn!("AAD mismatch");
@@ -689,7 +696,8 @@ async fn transaction_purchase_handler(
     let response_timestamp = current_timestamp_ms().to_string();
 
     // Build response AAD
-    let response_aad = build_aad("200", "/transaction/purchase", &response_timestamp, &response_nonce, kid);
+    // AAD format: TIMESTAMP|NONCE|KID|CLIENTID
+    let response_aad = build_aad(&response_timestamp, &response_nonce, kid, client_id);
 
     let (response_ciphertext, response_tag) = metrics.measure("aes-gcm-encrypt", || {
         aes_gcm_encrypt(&session_key, &response_iv, &response_aad, &response_plaintext).unwrap()

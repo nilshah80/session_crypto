@@ -5,6 +5,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 
 const string ServerUrl = "http://localhost:3000";
+const string ClientId = "DOTNET_CLIENT";
 
 // Shared HttpClient instance for connection pooling (critical for performance)
 var httpClient = new HttpClient();
@@ -198,13 +199,14 @@ async Task<(SessionContext Session, EndpointMetrics Metrics)> InitSession(bool v
     var nonce = Guid.NewGuid().ToString();
     var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString();
 
-    var requestBody = new SessionInitRequest("ECDH_P256", Convert.ToBase64String(clientPubRaw), 1800);
+    var requestBody = new SessionInitRequest(Convert.ToBase64String(clientPubRaw), 1800);
 
     if (verbose)
     {
         Console.WriteLine("\n  📤 Sending POST /session/init");
         Console.WriteLine($"     X-Nonce: {nonce}");
         Console.WriteLine($"     X-Timestamp: {timestamp}");
+        Console.WriteLine($"     X-ClientId: {ClientId}");
     }
 
     // Time HTTP request (reusing shared httpClient for connection pooling)
@@ -214,6 +216,7 @@ async Task<(SessionContext Session, EndpointMetrics Metrics)> InitSession(bool v
     };
     request.Headers.Add("X-Nonce", nonce);
     request.Headers.Add("X-Timestamp", timestamp);
+    request.Headers.Add("X-ClientId", ClientId);
 
     var httpSw = Stopwatch.StartNew();
     var response = await httpClient.SendAsync(request);
@@ -257,8 +260,9 @@ async Task<(SessionContext Session, EndpointMetrics Metrics)> InitSession(bool v
         Console.WriteLine("\n  🔐 Computed ECDH shared secret");
 
     // Derive session key using HKDF
+    // Info includes clientId for domain separation
     var salt = Encoding.UTF8.GetBytes(data.SessionId);
-    var info = Encoding.UTF8.GetBytes("SESSION|A256GCM|AUTH");
+    var info = Encoding.UTF8.GetBytes($"SESSION|A256GCM|{ClientId}");
     byte[] sessionKey = null!;
     MeasureSync("hkdf", cryptoOps, () =>
     {
@@ -283,7 +287,7 @@ async Task<(SessionContext Session, EndpointMetrics Metrics)> InitSession(bool v
         serverTiming
     );
 
-    return (new SessionContext(data.SessionId, sessionKey, $"session:{data.SessionId}"), metrics);
+    return (new SessionContext(data.SessionId, sessionKey, $"session:{data.SessionId}", ClientId), metrics);
 }
 
 // ===== Make Purchase =====
@@ -309,13 +313,14 @@ async Task<EndpointMetrics> MakePurchase(SessionContext session, PurchaseRequest
     var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString();
 
     // Build AAD
-    var aad = Encoding.UTF8.GetBytes($"POST|/transaction/purchase|{timestamp}|{nonce}|{session.Kid}");
+    // Format: TIMESTAMP|NONCE|KID|CLIENTID
+    var aad = Encoding.UTF8.GetBytes($"{timestamp}|{nonce}|{session.Kid}|{session.ClientId}");
 
     if (verbose)
     {
         Console.WriteLine("\n  🔒 Encrypting request...");
         Console.WriteLine($"     IV (base64): {Convert.ToBase64String(iv)}");
-        Console.WriteLine($"     AAD: POST|/transaction/purchase|{timestamp}|{nonce[..8]}...|session:{session.SessionId[..8]}...");
+        Console.WriteLine($"     AAD: {timestamp}|{nonce[..8]}...|session:{session.SessionId[..8]}...|{session.ClientId}");
     }
 
     // Encrypt with AES-256-GCM
@@ -347,6 +352,7 @@ async Task<EndpointMetrics> MakePurchase(SessionContext session, PurchaseRequest
     request.Headers.Add("X-AAD", Convert.ToBase64String(aad));
     request.Headers.Add("X-Nonce", nonce);
     request.Headers.Add("X-Timestamp", timestamp);
+    request.Headers.Add("X-ClientId", session.ClientId);
 
     var httpSw = Stopwatch.StartNew();
     var response = await httpClient.SendAsync(request);
@@ -470,7 +476,6 @@ record BenchmarkStats(
     double P99Ms);
 
 record SessionInitRequest(
-    [property: JsonPropertyName("keyAgreement")] string KeyAgreement,
     [property: JsonPropertyName("clientPublicKey")] string ClientPublicKey,
     [property: JsonPropertyName("ttlSec")] int TtlSec);
 
@@ -480,7 +485,7 @@ record SessionInitResponse(
     [property: JsonPropertyName("encAlg")] string EncAlg,
     [property: JsonPropertyName("expiresInSec")] int ExpiresInSec);
 
-record SessionContext(string SessionId, byte[] SessionKey, string Kid);
+record SessionContext(string SessionId, byte[] SessionKey, string Kid, string ClientId);
 
 record PurchaseRequest(
     [property: JsonPropertyName("schemeCode")] string SchemeCode,

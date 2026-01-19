@@ -51,7 +51,6 @@ type BenchmarkStats struct {
 }
 
 type SessionInitRequest struct {
-	KeyAgreement    string `json:"keyAgreement"`
 	ClientPublicKey string `json:"clientPublicKey"`
 	TTLSec          int    `json:"ttlSec"`
 }
@@ -72,7 +71,11 @@ type SessionContext struct {
 	SessionID  string
 	SessionKey []byte
 	Kid        string
+	ClientID   string
 }
+
+// Client ID for this application
+const clientID = "GO_CLIENT"
 
 // ===== Metrics Helpers =====
 
@@ -292,10 +295,10 @@ func initSession(verbose bool) (*SessionContext, *EndpointMetrics, error) {
 		fmt.Println("\n  📤 Sending POST /session/init")
 		fmt.Printf("     X-Nonce: %s\n", nonce)
 		fmt.Printf("     X-Timestamp: %s\n", timestamp)
+		fmt.Printf("     X-ClientId: %s\n", clientID)
 	}
 
 	reqBody := SessionInitRequest{
-		KeyAgreement:    "ECDH_P256",
 		ClientPublicKey: base64.StdEncoding.EncodeToString(clientPubBytes),
 		TTLSec:          1800,
 	}
@@ -305,6 +308,7 @@ func initSession(verbose bool) (*SessionContext, *EndpointMetrics, error) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Nonce", nonce)
 	req.Header.Set("X-Timestamp", timestamp)
+	req.Header.Set("X-ClientId", clientID)
 
 	httpStart := time.Now()
 	resp, err := http.DefaultClient.Do(req)
@@ -362,10 +366,11 @@ func initSession(verbose bool) (*SessionContext, *EndpointMetrics, error) {
 	}
 
 	// Derive session key using HKDF
+	// Info includes clientId for domain separation
 	var sessionKey []byte
 	measureSync("hkdf", &cryptoOps, func() any {
 		salt := []byte(data.SessionID)
-		info := []byte("SESSION|A256GCM|AUTH")
+		info := []byte(fmt.Sprintf("SESSION|A256GCM|%s", clientID))
 		hkdfReader := hkdf.New(sha256.New, sharedSecret, salt, info)
 		sessionKey = make([]byte, 32)
 		io.ReadFull(hkdfReader, sessionKey)
@@ -389,6 +394,7 @@ func initSession(verbose bool) (*SessionContext, *EndpointMetrics, error) {
 		SessionID:  data.SessionID,
 		SessionKey: sessionKey,
 		Kid:        "session:" + data.SessionID,
+		ClientID:   clientID,
 	}, metrics, nil
 }
 
@@ -416,13 +422,14 @@ func makePurchase(session *SessionContext, purchaseData PurchaseRequest, verbose
 	timestamp := fmt.Sprintf("%d", time.Now().UnixMilli())
 
 	// Build AAD
-	aad := []byte(fmt.Sprintf("POST|/transaction/purchase|%s|%s|%s", timestamp, nonce, session.Kid))
+	// Format: TIMESTAMP|NONCE|KID|CLIENTID
+	aad := []byte(fmt.Sprintf("%s|%s|%s|%s", timestamp, nonce, session.Kid, session.ClientID))
 
 	if verbose {
 		fmt.Println("\n  🔒 Encrypting request...")
 		fmt.Printf("     IV (base64): %s\n", base64.StdEncoding.EncodeToString(iv))
-		fmt.Printf("     AAD: POST|/transaction/purchase|%s|%s...|session:%s...\n",
-			timestamp, nonce[:8], session.SessionID[:8])
+		fmt.Printf("     AAD: %s|%s...|session:%s...|%s\n",
+			timestamp, nonce[:8], session.SessionID[:8], session.ClientID)
 	}
 
 	// Encrypt with AES-256-GCM
@@ -453,6 +460,7 @@ func makePurchase(session *SessionContext, purchaseData PurchaseRequest, verbose
 	req.Header.Set("X-AAD", base64.StdEncoding.EncodeToString(aad))
 	req.Header.Set("X-Nonce", nonce)
 	req.Header.Set("X-Timestamp", timestamp)
+	req.Header.Set("X-ClientId", session.ClientID)
 
 	httpStart := time.Now()
 	resp, err := http.DefaultClient.Do(req)

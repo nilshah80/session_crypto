@@ -80,7 +80,6 @@ fastify.addHook("onSend", async (request, reply) => {
 
 // Types
 interface SessionInitBody {
-  keyAgreement: string;
   clientPublicKey: string;
   ttlSec?: number;
 }
@@ -100,9 +99,10 @@ fastify.post<{
 }>("/session/init", async (request, reply) => {
   const nonce = request.headers["x-nonce"] as string | undefined;
   const timestamp = request.headers["x-timestamp"] as string | undefined;
+  const clientId = request.headers["x-clientid"] as string | undefined;
 
   // Validate required headers
-  if (!nonce || !timestamp) {
+  if (!nonce || !timestamp || !clientId) {
     return reply.status(400).send({ error: "CRYPTO_ERROR" });
   }
 
@@ -117,11 +117,7 @@ fastify.post<{
   }
 
   // Validate request body
-  const { keyAgreement, clientPublicKey, ttlSec } = request.body;
-
-  if (keyAgreement !== "ECDH_P256") {
-    return reply.status(400).send({ error: "CRYPTO_ERROR" });
-  }
+  const { clientPublicKey, ttlSec } = request.body;
 
   if (!clientPublicKey) {
     return reply.status(400).send({ error: "CRYPTO_ERROR" });
@@ -158,10 +154,9 @@ fastify.post<{
   const allowedTtl = Math.min(Math.max(ttlSec ?? 1800, 300), 3600);
 
   // Derive session key using HKDF
-  // Using a fixed info string since we don't have token introspection here
-  // In production with APIM, you might pass principal info via headers
+  // Info includes clientId for domain separation
   const salt = Buffer.from(sessionId, "utf8");
-  const info = Buffer.from("SESSION|A256GCM|AUTH", "utf8");
+  const info = Buffer.from(`SESSION|A256GCM|${clientId}`, "utf8");
   const sessionKey = request.metrics!.measure("hkdf", () =>
     hkdf32(sharedSecret, salt, info)
   );
@@ -191,9 +186,10 @@ fastify.post("/transaction/purchase", async (request, reply) => {
   const aadB64 = request.headers["x-aad"] as string | undefined;
   const nonce = request.headers["x-nonce"] as string | undefined;
   const timestamp = request.headers["x-timestamp"] as string | undefined;
+  const clientId = request.headers["x-clientid"] as string | undefined;
 
   // Validate all required headers
-  if (!kid || !encAlg || !ivB64 || !tagB64 || !aadB64 || !nonce || !timestamp) {
+  if (!kid || !encAlg || !ivB64 || !tagB64 || !aadB64 || !nonce || !timestamp || !clientId) {
     return reply.status(400).send({ error: "CRYPTO_ERROR" });
   }
 
@@ -247,8 +243,9 @@ fastify.post("/transaction/purchase", async (request, reply) => {
   }
 
   // Rebuild expected AAD and verify it matches
+  // AAD format: TIMESTAMP|NONCE|KID|CLIENTID
   const expectedAad = request.metrics!.measure("aad-validation", () =>
-    buildAad("POST", "/transaction/purchase", timestamp, nonce, kid)
+    buildAad(timestamp, nonce, kid, clientId)
   );
   if (!aad.equals(expectedAad)) {
     request.log.warn("AAD mismatch");
@@ -296,12 +293,12 @@ fastify.post("/transaction/purchase", async (request, reply) => {
   const responseTimestamp = Date.now().toString();
 
   // Build response AAD
+  // AAD format: TIMESTAMP|NONCE|KID|CLIENTID
   const responseAad = buildAad(
-    "200",
-    "/transaction/purchase",
     responseTimestamp,
     responseNonce,
-    kid
+    kid,
+    clientId
   );
 
   const { ciphertext: responseCiphertext, tag: responseTag } =

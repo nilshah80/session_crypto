@@ -91,7 +91,11 @@ interface SessionContext {
   sessionId: string;
   sessionKey: Buffer;
   kid: string;
+  clientId: string;
 }
+
+// Client ID for this application
+const CLIENT_ID = "NODE_CLIENT";
 
 // ===== Step 1: Initialize session with server =====
 async function initSession(
@@ -123,7 +127,6 @@ async function initSession(
   const timestamp = Date.now().toString();
 
   const requestBody = {
-    keyAgreement: "ECDH_P256",
     clientPublicKey: b64(clientPub),
     ttlSec: 1800,
   };
@@ -132,6 +135,7 @@ async function initSession(
     console.log("\n  📤 Sending POST /session/init");
     console.log(`     X-Nonce: ${nonce}`);
     console.log(`     X-Timestamp: ${timestamp}`);
+    console.log(`     X-ClientId: ${CLIENT_ID}`);
   }
 
   // Time HTTP request
@@ -142,6 +146,7 @@ async function initSession(
       "Content-Type": "application/json",
       "X-Nonce": nonce,
       "X-Timestamp": timestamp,
+      "X-ClientId": CLIENT_ID,
     },
     body: JSON.stringify(requestBody),
   });
@@ -183,8 +188,9 @@ async function initSession(
   }
 
   // Derive session key using HKDF (must match server's derivation)
+  // Info includes clientId for domain separation
   const salt = Buffer.from(data.sessionId, "utf8");
-  const info = Buffer.from("SESSION|A256GCM|AUTH", "utf8");
+  const info = Buffer.from(`SESSION|A256GCM|${CLIENT_ID}`, "utf8");
   const sessionKey = measureSync("hkdf", cryptoOps, () =>
     hkdf32(sharedSecret, salt, info)
   );
@@ -211,6 +217,7 @@ async function initSession(
       sessionId: data.sessionId,
       sessionKey,
       kid,
+      clientId: CLIENT_ID,
     },
     metrics,
   };
@@ -243,19 +250,19 @@ async function makePurchase(
   const timestamp = Date.now().toString();
 
   // Build AAD
+  // Format: TIMESTAMP|NONCE|KID|CLIENTID
   const aad = buildAad(
-    "POST",
-    "/transaction/purchase",
     timestamp,
     nonce,
-    session.kid
+    session.kid,
+    session.clientId
   );
 
   if (verbose) {
     console.log("\n  🔒 Encrypting request...");
     console.log(`     IV (base64): ${b64(iv)}`);
     console.log(
-      `     AAD: POST|/transaction/purchase|${timestamp}|${nonce.slice(0, 8)}...|session:${session.sessionId.slice(0, 8)}...`
+      `     AAD: ${timestamp}|${nonce.slice(0, 8)}...|session:${session.sessionId.slice(0, 8)}...|${session.clientId}`
     );
   }
 
@@ -283,6 +290,7 @@ async function makePurchase(
       "X-AAD": b64(aad),
       "X-Nonce": nonce,
       "X-Timestamp": timestamp,
+      "X-ClientId": session.clientId,
     },
     body: b64(ciphertext),
   });

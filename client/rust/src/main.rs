@@ -45,7 +45,6 @@ struct BenchmarkStats {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionInitRequest {
-    key_agreement: String,
     client_public_key: String,
     ttl_sec: i32,
 }
@@ -70,7 +69,11 @@ struct SessionContext {
     session_id: String,
     session_key: Vec<u8>,
     kid: String,
+    client_id: String,
 }
+
+// Client ID for this application
+const CLIENT_ID: &str = "RUST_CLIENT";
 
 // ===== Nonce Sequence for AES-GCM =====
 
@@ -354,10 +357,10 @@ async fn init_session(
         println!("\n  📤 Sending POST /session/init");
         println!("     X-Nonce: {}", nonce);
         println!("     X-Timestamp: {}", timestamp);
+        println!("     X-ClientId: {}", CLIENT_ID);
     }
 
     let req_body = SessionInitRequest {
-        key_agreement: "ECDH_P256".to_string(),
         client_public_key: BASE64.encode(&client_pub_bytes),
         ttl_sec: 1800,
     };
@@ -368,6 +371,7 @@ async fn init_session(
         .header("Content-Type", "application/json")
         .header("X-Nonce", &nonce)
         .header("X-Timestamp", &timestamp)
+        .header("X-ClientId", CLIENT_ID)
         .json(&req_body)
         .send()
         .await?;
@@ -417,10 +421,12 @@ async fn init_session(
     }
 
     // Derive session key using HKDF
+    // Info includes client_id for domain separation
     let session_key = measure_sync("hkdf", &mut crypto_ops, || {
         let salt = Salt::new(HKDF_SHA256, data.session_id.as_bytes());
         let prk = salt.extract(shared_secret.as_slice());
-        let info = &[b"SESSION|A256GCM|AUTH".as_slice()];
+        let info_str = format!("SESSION|A256GCM|{}", CLIENT_ID);
+        let info = &[info_str.as_bytes()];
         let okm = prk.expand(info, HKDF_SHA256).unwrap();
         let mut key = vec![0u8; 32];
         okm.fill(&mut key).unwrap();
@@ -448,6 +454,7 @@ async fn init_session(
             session_id: data.session_id.clone(),
             session_key,
             kid: format!("session:{}", data.session_id),
+            client_id: CLIENT_ID.to_string(),
         },
         metrics,
     ))
@@ -486,9 +493,10 @@ async fn make_purchase(
         .to_string();
 
     // Build AAD
+    // Format: TIMESTAMP|NONCE|KID|CLIENTID
     let aad = format!(
-        "POST|/transaction/purchase|{}|{}|{}",
-        timestamp, nonce_str, session.kid
+        "{}|{}|{}|{}",
+        timestamp, nonce_str, session.kid, session.client_id
     );
     let aad_bytes = aad.as_bytes();
 
@@ -496,10 +504,11 @@ async fn make_purchase(
         println!("\n  🔒 Encrypting request...");
         println!("     IV (base64): {}", BASE64.encode(&iv));
         println!(
-            "     AAD: POST|/transaction/purchase|{}|{}...|session:{}...",
+            "     AAD: {}|{}...|session:{}...|{}",
             timestamp,
             &nonce_str[..8],
-            &session.session_id[..8]
+            &session.session_id[..8],
+            session.client_id
         );
     }
 
@@ -534,6 +543,7 @@ async fn make_purchase(
         .header("X-AAD", BASE64.encode(aad_bytes))
         .header("X-Nonce", &nonce_str)
         .header("X-Timestamp", &timestamp)
+        .header("X-ClientId", &session.client_id)
         .body(BASE64.encode(&ciphertext))
         .send()
         .await?;

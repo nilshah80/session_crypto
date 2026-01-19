@@ -27,6 +27,7 @@ import java.util.regex.Pattern;
  */
 public class SessionCryptoClient {
     private static final String SERVER_URL = "http://localhost:3000";
+    private static final String CLIENT_ID = "JAVA_VT_CLIENT";
     private static final ObjectMapper mapper = new ObjectMapper();
 
     // Shared SecureRandom instance (thread-safe, avoid getInstanceStrong per request)
@@ -197,10 +198,10 @@ public class SessionCryptoClient {
             System.out.println("\n  📤 Sending POST /session/init");
             System.out.println("     X-Nonce: " + nonce);
             System.out.println("     X-Timestamp: " + timestamp);
+            System.out.println("     X-ClientId: " + CLIENT_ID);
         }
 
         SessionInitRequest requestBody = new SessionInitRequest(
-            "ECDH_P256",
             Base64.getEncoder().encodeToString(clientPubRaw),
             1800
         );
@@ -210,6 +211,7 @@ public class SessionCryptoClient {
             .header("Content-Type", "application/json")
             .header("X-Nonce", nonce)
             .header("X-Timestamp", timestamp)
+            .header("X-ClientId", CLIENT_ID)
             .POST(HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(requestBody)))
             .build();
 
@@ -254,8 +256,9 @@ public class SessionCryptoClient {
         }
 
         // Derive session key using HKDF
+        // Info includes clientId for domain separation
         byte[] salt = data.sessionId.getBytes(StandardCharsets.UTF_8);
-        byte[] info = "SESSION|A256GCM|AUTH".getBytes(StandardCharsets.UTF_8);
+        byte[] info = ("SESSION|A256GCM|" + CLIENT_ID).getBytes(StandardCharsets.UTF_8);
         byte[] sessionKey = measureSync("hkdf", cryptoOps, () -> {
             try {
                 return hkdf(sharedSecret, salt, info, 32);
@@ -279,7 +282,7 @@ public class SessionCryptoClient {
         );
 
         return new InitResult(
-            new SessionContext(data.sessionId, sessionKey, "session:" + data.sessionId),
+            new SessionContext(data.sessionId, sessionKey, "session:" + data.sessionId, CLIENT_ID),
             metrics
         );
     }
@@ -305,14 +308,15 @@ public class SessionCryptoClient {
         String timestamp = String.valueOf(System.currentTimeMillis());
 
         // Build AAD
-        String aadStr = "POST|/transaction/purchase|" + timestamp + "|" + nonce + "|" + session.kid;
+        // Format: TIMESTAMP|NONCE|KID|CLIENTID
+        String aadStr = timestamp + "|" + nonce + "|" + session.kid + "|" + session.clientId;
         byte[] aad = aadStr.getBytes(StandardCharsets.UTF_8);
 
         if (verbose) {
             System.out.println("\n  🔒 Encrypting request...");
             System.out.println("     IV (base64): " + Base64.getEncoder().encodeToString(iv));
-            System.out.println("     AAD: POST|/transaction/purchase|" + timestamp + "|" +
-                nonce.substring(0, 8) + "...|session:" + session.sessionId.substring(0, 8) + "...");
+            System.out.println("     AAD: " + timestamp + "|" +
+                nonce.substring(0, 8) + "...|session:" + session.sessionId.substring(0, 8) + "...|" + session.clientId);
         }
 
         // Encrypt with AES-256-GCM
@@ -355,6 +359,7 @@ public class SessionCryptoClient {
             .header("X-AAD", Base64.getEncoder().encodeToString(aad))
             .header("X-Nonce", nonce)
             .header("X-Timestamp", timestamp)
+            .header("X-ClientId", session.clientId)
             .POST(HttpRequest.BodyPublishers.ofString(Base64.getEncoder().encodeToString(ciphertext)))
             .build();
 
@@ -600,7 +605,6 @@ public class SessionCryptoClient {
 
     // Records for request/response
     record SessionInitRequest(
-        @JsonProperty("keyAgreement") String keyAgreement,
         @JsonProperty("clientPublicKey") String clientPublicKey,
         @JsonProperty("ttlSec") int ttlSec
     ) {}
@@ -617,5 +621,5 @@ public class SessionCryptoClient {
         @JsonProperty("amount") int amount
     ) {}
 
-    record SessionContext(String sessionId, byte[] sessionKey, String kid) {}
+    record SessionContext(String sessionId, byte[] sessionKey, String kid, String clientId) {}
 }

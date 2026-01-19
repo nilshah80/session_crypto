@@ -49,14 +49,14 @@ export function aesGcmDecrypt(
 }
 
 // Build AAD from request components
+// Format: TIMESTAMP|NONCE|KID|CLIENTID
 export function buildAad(
-  method: string,
-  path: string,
   ts: string,
   nonce: string,
-  kid: string
+  kid: string,
+  clientId: string
 ): Buffer {
-  return Buffer.from(`${method}|${path}|${ts}|${nonce}|${kid}`, "utf8");
+  return Buffer.from(`${ts}|${nonce}|${kid}|${clientId}`, "utf8");
 }
 
 // Generate random IV (12 bytes for AES-GCM)

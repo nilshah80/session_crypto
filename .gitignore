@@ -55,3 +55,4 @@ server-rust/Cargo.lock
 redis_data/
 target/rust-analyzer/flycheck0/stderr
 target/rust-analyzer/flycheck0/stdout
+client/go/go-client
