@@ -198,14 +198,14 @@ async Task<(SessionContext Session, EndpointMetrics Metrics)> InitSession(bool v
     // Prepare request
     var nonce = Guid.NewGuid().ToString();
     var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString();
+    var requestId = $"{timestamp}.{nonce}";
 
     var requestBody = new SessionInitRequest(Convert.ToBase64String(clientPubRaw), 1800);
 
     if (verbose)
     {
         Console.WriteLine("\n  📤 Sending POST /session/init");
-        Console.WriteLine($"     X-Nonce: {nonce}");
-        Console.WriteLine($"     X-Timestamp: {timestamp}");
+        Console.WriteLine($"     X-Idempotency-Key: {requestId}");
         Console.WriteLine($"     X-ClientId: {ClientId}");
     }
 
@@ -214,8 +214,7 @@ async Task<(SessionContext Session, EndpointMetrics Metrics)> InitSession(bool v
     {
         Content = new StringContent(JsonSerializer.Serialize(requestBody), Encoding.UTF8, "application/json")
     };
-    request.Headers.Add("X-Nonce", nonce);
-    request.Headers.Add("X-Timestamp", timestamp);
+    request.Headers.Add("X-Idempotency-Key", requestId);
     request.Headers.Add("X-ClientId", ClientId);
 
     var httpSw = Stopwatch.StartNew();
@@ -307,10 +306,10 @@ async Task<EndpointMetrics> MakePurchase(SessionContext session, PurchaseRequest
         Console.WriteLine($"     {JsonSerializer.Serialize(purchaseData)}");
     }
 
-    // Generate IV and nonce
-    var iv = RandomNumberGenerator.GetBytes(12);
+    // Generate nonce and timestamp for replay protection
     var nonce = Guid.NewGuid().ToString();
     var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString();
+    var requestId = $"{timestamp}.{nonce}";
 
     // Build AAD
     // Format: TIMESTAMP|NONCE|KID|CLIENTID
@@ -319,39 +318,40 @@ async Task<EndpointMetrics> MakePurchase(SessionContext session, PurchaseRequest
     if (verbose)
     {
         Console.WriteLine("\n  🔒 Encrypting request...");
-        Console.WriteLine($"     IV (base64): {Convert.ToBase64String(iv)}");
         Console.WriteLine($"     AAD: {timestamp}|{nonce[..8]}...|session:{session.SessionId[..8]}...|{session.ClientId}");
     }
 
-    // Encrypt with AES-256-GCM
+    // Encrypt with AES-256-GCM - returns IV || ciphertext || tag
+    var iv = RandomNumberGenerator.GetBytes(12);
     var ciphertext = new byte[plaintext.Length];
     var tag = new byte[16];
     using var aesGcm = new AesGcm(session.SessionKey, 16);
 
+    byte[] encryptedBody = null!;
     MeasureSync("aes-gcm-encrypt", cryptoOps, () =>
     {
         aesGcm.Encrypt(iv, plaintext, ciphertext, tag, aad);
+        // Concatenate: IV (12) || ciphertext || tag (16)
+        encryptedBody = new byte[12 + ciphertext.Length + 16];
+        iv.CopyTo(encryptedBody, 0);
+        ciphertext.CopyTo(encryptedBody, 12);
+        tag.CopyTo(encryptedBody, 12 + ciphertext.Length);
     });
 
     if (verbose)
     {
-        Console.WriteLine($"     Ciphertext length: {ciphertext.Length} bytes");
-        Console.WriteLine($"     Auth tag (base64): {Convert.ToBase64String(tag)}");
+        Console.WriteLine($"     Encrypted body length: {encryptedBody.Length} bytes (IV + ciphertext + tag)");
         Console.WriteLine("\n  📤 Sending encrypted POST /transaction/purchase");
     }
 
     // Time HTTP request (reusing shared httpClient for connection pooling)
     var request = new HttpRequestMessage(HttpMethod.Post, $"{ServerUrl}/transaction/purchase")
     {
-        Content = new StringContent(Convert.ToBase64String(ciphertext), Encoding.UTF8, "application/octet-stream")
+        Content = new ByteArrayContent(encryptedBody)
     };
+    request.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/octet-stream");
     request.Headers.Add("X-Kid", session.Kid);
-    request.Headers.Add("X-Enc-Alg", "A256GCM");
-    request.Headers.Add("X-IV", Convert.ToBase64String(iv));
-    request.Headers.Add("X-Tag", Convert.ToBase64String(tag));
-    request.Headers.Add("X-AAD", Convert.ToBase64String(aad));
-    request.Headers.Add("X-Nonce", nonce);
-    request.Headers.Add("X-Timestamp", timestamp);
+    request.Headers.Add("X-Idempotency-Key", requestId);
     request.Headers.Add("X-ClientId", session.ClientId);
 
     var httpSw = Stopwatch.StartNew();
@@ -370,31 +370,41 @@ async Task<EndpointMetrics> MakePurchase(SessionContext session, PurchaseRequest
         ? values.First()
         : null;
 
-    if (verbose)
-        Console.WriteLine($"\n  📥 Received encrypted response (status: {(int)response.StatusCode})");
-
     // Extract response headers
-    var respIvB64 = response.Headers.GetValues("X-IV").First();
-    var respTagB64 = response.Headers.GetValues("X-Tag").First();
-    var respAadB64 = response.Headers.GetValues("X-AAD").First();
+    var respKid = response.Headers.GetValues("X-Kid").First();
+    var respRequestId = response.Headers.GetValues("X-Idempotency-Key").First();
 
     if (verbose)
     {
+        Console.WriteLine($"\n  📥 Received encrypted response (status: {(int)response.StatusCode})");
         Console.WriteLine("     Response headers:");
-        Console.WriteLine($"       X-Kid: {response.Headers.GetValues("X-Kid").First()}");
-        Console.WriteLine($"       X-Enc-Alg: {response.Headers.GetValues("X-Enc-Alg").First()}");
-        Console.WriteLine($"       X-IV: {respIvB64[..Math.Min(16, respIvB64.Length)]}...");
-        Console.WriteLine($"       X-Tag: {respTagB64[..Math.Min(20, respTagB64.Length)]}...");
+        Console.WriteLine($"       X-Kid: {respKid}");
+        Console.WriteLine($"       X-Idempotency-Key: {respRequestId[..Math.Min(30, respRequestId.Length)]}...");
     }
 
-    // Decode and decrypt response
-    var respIv = Convert.FromBase64String(respIvB64);
-    var respTag = Convert.FromBase64String(respTagB64);
-    var respAad = Convert.FromBase64String(respAadB64);
-    var respCiphertext = Convert.FromBase64String(await response.Content.ReadAsStringAsync());
+    // Parse response request ID to get timestamp and nonce for AAD reconstruction
+    var respParts = respRequestId.Split('.');
+    if (respParts.Length != 2)
+        throw new Exception("Invalid X-Idempotency-Key format in response");
+    var respTimestamp = respParts[0];
+    var respNonce = respParts[1];
+
+    // Reconstruct AAD from response headers
+    var respAad = Encoding.UTF8.GetBytes($"{respTimestamp}|{respNonce}|{respKid}|{session.ClientId}");
+
+    // Get encrypted body (IV || ciphertext || tag)
+    var respEncryptedBody = await response.Content.ReadAsByteArrayAsync();
 
     if (verbose)
+    {
+        Console.WriteLine($"     Encrypted body length: {respEncryptedBody.Length} bytes");
         Console.WriteLine("\n  🔓 Decrypting response...");
+    }
+
+    // Extract IV (first 12 bytes), ciphertext (middle), and tag (last 16 bytes)
+    var respIv = respEncryptedBody[..12];
+    var respTag = respEncryptedBody[^16..];
+    var respCiphertext = respEncryptedBody[12..^16];
 
     var respPlaintext = new byte[respCiphertext.Length];
     MeasureSync("aes-gcm-decrypt", cryptoOps, () =>

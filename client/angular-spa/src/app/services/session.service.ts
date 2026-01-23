@@ -106,6 +106,7 @@ export class SessionService {
 
     const nonce = this.crypto.generateNonce();
     const timestamp = Date.now().toString();
+    const requestId = `${timestamp}.${nonce}`;
 
     const requestBody = {
       clientPublicKey: this.crypto.toBase64(keyPair.publicKeyBytes),
@@ -114,8 +115,7 @@ export class SessionService {
 
     if (verbose) {
       console.log('\n  📤 Sending POST /session/init');
-      console.log(`     X-Nonce: ${nonce}`);
-      console.log(`     X-Timestamp: ${timestamp}`);
+      console.log(`     X-Idempotency-Key: ${requestId}`);
       console.log(`     X-ClientId: ${this.CLIENT_ID}`);
     }
 
@@ -128,8 +128,7 @@ export class SessionService {
         {
           headers: new HttpHeaders({
             'Content-Type': 'application/json',
-            'X-Nonce': nonce,
-            'X-Timestamp': timestamp,
+            'X-Idempotency-Key': requestId,
             'X-ClientId': this.CLIENT_ID
           }),
           observe: 'response'
@@ -211,11 +210,12 @@ export class SessionService {
 
     const nonce = this.crypto.generateNonce();
     const timestamp = Date.now().toString();
+    const requestId = `${timestamp}.${nonce}`;
 
     // Build AAD: TIMESTAMP|NONCE|KID|CLIENTID
     const aad = this.crypto.buildAad(timestamp, nonce, session.kid, session.clientId);
 
-    // Encrypt the payload (IV is generated inside aesGcmEncrypt)
+    // Encrypt the payload - returns IV || ciphertext || tag
     const plaintext = this.crypto.stringToBytes(JSON.stringify(purchaseData));
     const encrypted = await this.measure('aes-gcm-encrypt', cryptoOps, () =>
       this.crypto.aesGcmEncrypt(session.sessionKey, plaintext, aad)
@@ -223,22 +223,15 @@ export class SessionService {
 
     if (verbose) {
       console.log('\n  🔒 Encrypting request...');
-      console.log(`     IV (base64): ${this.crypto.toBase64(encrypted.iv)}`);
       console.log(`     AAD: ${timestamp}|${nonce.slice(0, 8)}...|session:${session.sessionId.slice(0, 8)}...|${session.clientId}`);
-      console.log(`     Ciphertext length: ${encrypted.ciphertext.length} bytes`);
-      console.log(`     Auth tag (base64): ${this.crypto.toBase64(encrypted.tag)}`);
+      console.log(`     Encrypted body length: ${encrypted.encryptedBody.length} bytes (IV + ciphertext + tag)`);
     }
 
-    // Build request headers - use IV from encryption result
+    // Build request headers (reduced from 9 to 3 custom headers)
     const headers = new HttpHeaders({
-      'Content-Type': 'text/plain',
+      'Content-Type': 'application/octet-stream',
       'X-Kid': session.kid,
-      'X-Enc-Alg': 'A256GCM',
-      'X-IV': this.crypto.toBase64(encrypted.iv),
-      'X-Tag': this.crypto.toBase64(encrypted.tag),
-      'X-AAD': this.crypto.toBase64(aad),
-      'X-Nonce': nonce,
-      'X-Timestamp': timestamp,
+      'X-Idempotency-Key': requestId,
       'X-ClientId': session.clientId
     });
 
@@ -246,16 +239,18 @@ export class SessionService {
       console.log('\n  📤 Sending encrypted POST /transaction/purchase');
     }
 
-    // Make HTTP request
+    // Make HTTP request with binary body
+    // Wrap Uint8Array in Blob to ensure Angular sends it as raw binary
+    const blob = new Blob([encrypted.encryptedBody], { type: 'application/octet-stream' });
     const httpStart = performance.now();
     const response = await firstValueFrom(
       this.http.post(
         `${this.SERVER_URL}/transaction/purchase`,
-        this.crypto.toBase64(encrypted.ciphertext),
+        blob,
         {
           headers,
           observe: 'response',
-          responseType: 'text'
+          responseType: 'arraybuffer'
         }
       )
     );
@@ -263,32 +258,43 @@ export class SessionService {
 
     const serverTiming = this.parseServerTiming(response.headers.get('Server-Timing'));
 
+    // Extract response headers
+    const respKid = response.headers.get('X-Kid');
+    const respRequestId = response.headers.get('X-Idempotency-Key');
+
     if (verbose) {
       console.log(`\n  📥 Received encrypted response (status: ${response.status})`);
       console.log('     Response headers:');
-      console.log(`       X-Kid: ${response.headers.get('X-Kid')}`);
-      console.log(`       X-Enc-Alg: ${response.headers.get('X-Enc-Alg')}`);
-      console.log(`       X-IV: ${response.headers.get('X-IV')?.slice(0, 20)}...`);
-      console.log(`       X-Tag: ${response.headers.get('X-Tag')?.slice(0, 20)}...`);
+      console.log(`       X-Kid: ${respKid}`);
+      console.log(`       X-Idempotency-Key: ${respRequestId?.slice(0, 30)}...`);
     }
 
-    // Decrypt response
-    const responseIv = this.crypto.fromBase64(response.headers.get('X-IV')!);
-    const responseTag = this.crypto.fromBase64(response.headers.get('X-Tag')!);
-    const responseAad = this.crypto.fromBase64(response.headers.get('X-AAD')!);
-    const responseCiphertext = this.crypto.fromBase64(response.body!);
+    if (!respKid || !respRequestId) {
+      throw new Error('Missing required headers in response');
+    }
+
+    // Parse response request ID to get timestamp and nonce for AAD reconstruction
+    const [respTimestamp, respNonce] = respRequestId.split('.');
+    if (!respTimestamp || !respNonce) {
+      throw new Error('Invalid X-Idempotency-Key format in response');
+    }
+
+    // Reconstruct AAD from response headers
+    const responseAad = this.crypto.buildAad(respTimestamp, respNonce, respKid, session.clientId);
+
+    // Get encrypted body (IV || ciphertext || tag)
+    const responseEncryptedBody = new Uint8Array(response.body as ArrayBuffer);
 
     if (verbose) {
+      console.log(`     Encrypted body length: ${responseEncryptedBody.length} bytes`);
       console.log('\n  🔓 Decrypting response...');
     }
 
     const decrypted = await this.measure('aes-gcm-decrypt', cryptoOps, () =>
       this.crypto.aesGcmDecrypt(
         session.sessionKey,
-        responseIv,
         responseAad,
-        responseCiphertext,
-        responseTag
+        responseEncryptedBody
       )
     );
 

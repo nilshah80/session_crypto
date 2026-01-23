@@ -290,11 +290,11 @@ func initSession(verbose bool) (*SessionContext, *EndpointMetrics, error) {
 
 	nonce := uuid.New().String()
 	timestamp := fmt.Sprintf("%d", time.Now().UnixMilli())
+	requestID := fmt.Sprintf("%s.%s", timestamp, nonce)
 
 	if verbose {
 		fmt.Println("\n  📤 Sending POST /session/init")
-		fmt.Printf("     X-Nonce: %s\n", nonce)
-		fmt.Printf("     X-Timestamp: %s\n", timestamp)
+		fmt.Printf("     X-Idempotency-Key: %s\n", requestID)
 		fmt.Printf("     X-ClientId: %s\n", clientID)
 	}
 
@@ -306,8 +306,7 @@ func initSession(verbose bool) (*SessionContext, *EndpointMetrics, error) {
 	reqJSON, _ := json.Marshal(reqBody)
 	req, _ := http.NewRequest("POST", serverURL+"/session/init", bytes.NewReader(reqJSON))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Nonce", nonce)
-	req.Header.Set("X-Timestamp", timestamp)
+	req.Header.Set("X-Idempotency-Key", requestID)
 	req.Header.Set("X-ClientId", clientID)
 
 	httpStart := time.Now()
@@ -415,51 +414,44 @@ func makePurchase(session *SessionContext, purchaseData PurchaseRequest, verbose
 		fmt.Printf("     %s\n", string(plaintext))
 	}
 
-	// Generate IV and nonce
-	iv := make([]byte, 12)
-	rand.Read(iv)
+	// Generate nonce and timestamp for replay protection
 	nonce := uuid.New().String()
 	timestamp := fmt.Sprintf("%d", time.Now().UnixMilli())
+	requestID := fmt.Sprintf("%s.%s", timestamp, nonce)
 
-	// Build AAD
+	// Build AAD (server will reconstruct from headers)
 	// Format: TIMESTAMP|NONCE|KID|CLIENTID
 	aad := []byte(fmt.Sprintf("%s|%s|%s|%s", timestamp, nonce, session.Kid, session.ClientID))
 
 	if verbose {
 		fmt.Println("\n  🔒 Encrypting request...")
-		fmt.Printf("     IV (base64): %s\n", base64.StdEncoding.EncodeToString(iv))
 		fmt.Printf("     AAD: %s|%s...|session:%s...|%s\n",
 			timestamp, nonce[:8], session.SessionID[:8], session.ClientID)
 	}
 
-	// Encrypt with AES-256-GCM
+	// Encrypt with AES-256-GCM - returns IV || ciphertext || tag
 	block, _ := aes.NewCipher(session.SessionKey)
 	aesGCM, _ := cipher.NewGCM(block)
 
-	var ciphertext, tag []byte
+	var encryptedBody []byte
 	measureSync("aes-gcm-encrypt", &cryptoOps, func() any {
+		iv := make([]byte, 12)
+		rand.Read(iv)
 		ciphertextWithTag := aesGCM.Seal(nil, iv, plaintext, aad)
-		ciphertext = ciphertextWithTag[:len(ciphertextWithTag)-16]
-		tag = ciphertextWithTag[len(ciphertextWithTag)-16:]
+		encryptedBody = append(iv, ciphertextWithTag...) // IV || ciphertext || tag
 		return nil
 	})
 
 	if verbose {
-		fmt.Printf("     Ciphertext length: %d bytes\n", len(ciphertext))
-		fmt.Printf("     Auth tag (base64): %s\n", base64.StdEncoding.EncodeToString(tag))
+		fmt.Printf("     Encrypted body length: %d bytes (IV + ciphertext + tag)\n", len(encryptedBody))
 		fmt.Println("\n  📤 Sending encrypted POST /transaction/purchase")
 	}
 
 	req, _ := http.NewRequest("POST", serverURL+"/transaction/purchase",
-		bytes.NewReader([]byte(base64.StdEncoding.EncodeToString(ciphertext))))
+		bytes.NewReader(encryptedBody))
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("X-Kid", session.Kid)
-	req.Header.Set("X-Enc-Alg", "A256GCM")
-	req.Header.Set("X-IV", base64.StdEncoding.EncodeToString(iv))
-	req.Header.Set("X-Tag", base64.StdEncoding.EncodeToString(tag))
-	req.Header.Set("X-AAD", base64.StdEncoding.EncodeToString(aad))
-	req.Header.Set("X-Nonce", nonce)
-	req.Header.Set("X-Timestamp", timestamp)
+	req.Header.Set("X-Idempotency-Key", requestID)
 	req.Header.Set("X-ClientId", session.ClientID)
 
 	httpStart := time.Now()
@@ -483,29 +475,37 @@ func makePurchase(session *SessionContext, purchaseData PurchaseRequest, verbose
 	}
 
 	// Extract response headers
-	respIvB64 := resp.Header.Get("X-IV")
-	respTagB64 := resp.Header.Get("X-Tag")
-	respAadB64 := resp.Header.Get("X-AAD")
+	respKid := resp.Header.Get("X-Kid")
+	respRequestID := resp.Header.Get("X-Idempotency-Key")
 
 	if verbose {
 		fmt.Println("     Response headers:")
-		fmt.Printf("       X-Kid: %s\n", resp.Header.Get("X-Kid"))
-		fmt.Printf("       X-Enc-Alg: %s\n", resp.Header.Get("X-Enc-Alg"))
-		fmt.Printf("       X-IV: %s...\n", respIvB64[:16])
-		fmt.Printf("       X-Tag: %s...\n", respTagB64[:20])
+		fmt.Printf("       X-Kid: %s\n", respKid)
+		fmt.Printf("       X-Idempotency-Key: %s...\n", respRequestID[:30])
 		fmt.Println("\n  🔓 Decrypting response...")
 	}
 
-	// Decode and decrypt response
-	respIv, _ := base64.StdEncoding.DecodeString(respIvB64)
-	respTag, _ := base64.StdEncoding.DecodeString(respTagB64)
-	respAad, _ := base64.StdEncoding.DecodeString(respAadB64)
+	// Parse response request ID to get timestamp and nonce for AAD reconstruction
+	respParts := strings.Split(respRequestID, ".")
+	if len(respParts) != 2 {
+		return nil, fmt.Errorf("invalid X-Idempotency-Key format in response")
+	}
+	respTimestamp := respParts[0]
+	respNonce := respParts[1]
 
-	bodyBytes, _ := io.ReadAll(resp.Body)
-	respCiphertext, _ := base64.StdEncoding.DecodeString(string(bodyBytes))
+	// Reconstruct AAD from response headers
+	respAad := []byte(fmt.Sprintf("%s|%s|%s|%s", respTimestamp, respNonce, respKid, session.ClientID))
 
-	// Combine ciphertext and tag for decryption
-	respCiphertextWithTag := append(respCiphertext, respTag...)
+	// Get encrypted body (IV || ciphertext || tag)
+	respEncryptedBody, _ := io.ReadAll(resp.Body)
+
+	if verbose {
+		fmt.Printf("     Encrypted body length: %d bytes\n", len(respEncryptedBody))
+	}
+
+	// Extract IV, ciphertext+tag from body
+	respIv := respEncryptedBody[:12]
+	respCiphertextWithTag := respEncryptedBody[12:]
 
 	var respPlaintext []byte
 	measureSync("aes-gcm-decrypt", &cryptoOps, func() any {

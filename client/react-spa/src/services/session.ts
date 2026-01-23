@@ -96,6 +96,7 @@ export async function initSession(
 
   const nonce = crypto.generateNonce();
   const timestamp = Date.now().toString();
+  const requestId = `${timestamp}.${nonce}`;
 
   const requestBody = {
     clientPublicKey: crypto.toBase64(keyPair.publicKeyBytes),
@@ -104,8 +105,7 @@ export async function initSession(
 
   if (verbose) {
     log('\n  📤 Sending POST /session/init');
-    log(`     X-Nonce: ${nonce}`);
-    log(`     X-Timestamp: ${timestamp}`);
+    log(`     X-Idempotency-Key: ${requestId}`);
     log(`     X-ClientId: ${CLIENT_ID}`);
   }
 
@@ -115,8 +115,7 @@ export async function initSession(
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'X-Nonce': nonce,
-      'X-Timestamp': timestamp,
+      'X-Idempotency-Key': requestId,
       'X-ClientId': CLIENT_ID
     },
     body: JSON.stringify(requestBody)
@@ -197,11 +196,12 @@ export async function makePurchase(
 
   const nonce = crypto.generateNonce();
   const timestamp = Date.now().toString();
+  const requestId = `${timestamp}.${nonce}`;
 
   // Build AAD: TIMESTAMP|NONCE|KID|CLIENTID
   const aad = crypto.buildAad(timestamp, nonce, session.kid, session.clientId);
 
-  // Encrypt the payload (IV is generated inside aesGcmEncrypt)
+  // Encrypt the payload - returns IV || ciphertext || tag
   const plaintext = crypto.stringToBytes(JSON.stringify(purchaseData));
   const encrypted = await measure('aes-gcm-encrypt', cryptoOps, () =>
     crypto.aesGcmEncrypt(session.sessionKey, plaintext, aad)
@@ -209,32 +209,25 @@ export async function makePurchase(
 
   if (verbose) {
     log('\n  🔒 Encrypting request...');
-    log(`     IV (base64): ${crypto.toBase64(encrypted.iv)}`);
     log(`     AAD: ${timestamp}|${nonce.slice(0, 8)}...|session:${session.sessionId.slice(0, 8)}...|${session.clientId}`);
-    log(`     Ciphertext length: ${encrypted.ciphertext.length} bytes`);
-    log(`     Auth tag (base64): ${crypto.toBase64(encrypted.tag)}`);
+    log(`     Encrypted body length: ${encrypted.encryptedBody.length} bytes (IV + ciphertext + tag)`);
   }
 
   if (verbose) {
     log('\n  📤 Sending encrypted POST /transaction/purchase');
   }
 
-  // Make HTTP request
+  // Make HTTP request with binary body
   const httpStart = performance.now();
   const response = await fetch(`${SERVER_URL}/transaction/purchase`, {
     method: 'POST',
     headers: {
-      'Content-Type': 'text/plain',
+      'Content-Type': 'application/octet-stream',
       'X-Kid': session.kid,
-      'X-Enc-Alg': 'A256GCM',
-      'X-IV': crypto.toBase64(encrypted.iv),
-      'X-Tag': crypto.toBase64(encrypted.tag),
-      'X-AAD': crypto.toBase64(aad),
-      'X-Nonce': nonce,
-      'X-Timestamp': timestamp,
+      'X-Idempotency-Key': requestId,
       'X-ClientId': session.clientId
     },
-    body: crypto.toBase64(encrypted.ciphertext)
+    body: encrypted.encryptedBody
   });
   const httpMs = performance.now() - httpStart;
 
@@ -244,32 +237,43 @@ export async function makePurchase(
 
   const serverTiming = parseServerTiming(response.headers.get('Server-Timing'));
 
+  // Extract response headers
+  const respKid = response.headers.get('X-Kid');
+  const respRequestId = response.headers.get('X-Idempotency-Key');
+
   if (verbose) {
     log(`\n  📥 Received encrypted response (status: ${response.status})`);
     log('     Response headers:');
-    log(`       X-Kid: ${response.headers.get('X-Kid')}`);
-    log(`       X-Enc-Alg: ${response.headers.get('X-Enc-Alg')}`);
-    log(`       X-IV: ${response.headers.get('X-IV')?.slice(0, 20)}...`);
-    log(`       X-Tag: ${response.headers.get('X-Tag')?.slice(0, 20)}...`);
+    log(`       X-Kid: ${respKid}`);
+    log(`       X-Idempotency-Key: ${respRequestId?.slice(0, 30)}...`);
   }
 
-  // Decrypt response
-  const responseIv = crypto.fromBase64(response.headers.get('X-IV')!);
-  const responseTag = crypto.fromBase64(response.headers.get('X-Tag')!);
-  const responseAad = crypto.fromBase64(response.headers.get('X-AAD')!);
-  const responseCiphertext = crypto.fromBase64(await response.text());
+  if (!respKid || !respRequestId) {
+    throw new Error('Missing required headers in response');
+  }
+
+  // Parse response request ID to get timestamp and nonce for AAD reconstruction
+  const [respTimestamp, respNonce] = respRequestId.split('.');
+  if (!respTimestamp || !respNonce) {
+    throw new Error('Invalid X-Idempotency-Key format in response');
+  }
+
+  // Reconstruct AAD from response headers
+  const responseAad = crypto.buildAad(respTimestamp, respNonce, respKid, session.clientId);
+
+  // Get encrypted body (IV || ciphertext || tag)
+  const responseEncryptedBody = new Uint8Array(await response.arrayBuffer());
 
   if (verbose) {
+    log(`     Encrypted body length: ${responseEncryptedBody.length} bytes`);
     log('\n  🔓 Decrypting response...');
   }
 
   const decrypted = await measure('aes-gcm-decrypt', cryptoOps, () =>
     crypto.aesGcmDecrypt(
       session.sessionKey,
-      responseIv,
       responseAad,
-      responseCiphertext,
-      responseTag
+      responseEncryptedBody
     )
   );
 

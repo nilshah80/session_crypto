@@ -5,9 +5,8 @@ export interface KeyPair {
 }
 
 export interface EncryptedData {
-  ciphertext: Uint8Array;
-  iv: Uint8Array;
-  tag: Uint8Array;
+  // Body format: IV (12 bytes) || ciphertext || tag (16 bytes)
+  encryptedBody: Uint8Array;
 }
 
 const cryptoSubtle = window.crypto.subtle;
@@ -82,7 +81,7 @@ export async function hkdf(
   return new Uint8Array(derivedBits);
 }
 
-// AES-256-GCM encryption
+// AES-256-GCM encryption - returns IV || ciphertext || tag
 export async function aesGcmEncrypt(
   key: Uint8Array,
   plaintext: Uint8Array,
@@ -98,6 +97,7 @@ export async function aesGcmEncrypt(
     ['encrypt']
   );
 
+  // Web Crypto returns ciphertext || tag
   const ciphertextWithTag = await cryptoSubtle.encrypt(
     {
       name: 'AES-GCM',
@@ -109,21 +109,24 @@ export async function aesGcmEncrypt(
     plaintext
   );
 
-  const result = new Uint8Array(ciphertextWithTag);
-  const ciphertext = result.slice(0, -16);
-  const tag = result.slice(-16);
+  // Concatenate: IV (12 bytes) || ciphertext || tag (16 bytes)
+  const result = new Uint8Array(12 + ciphertextWithTag.byteLength);
+  result.set(iv, 0);
+  result.set(new Uint8Array(ciphertextWithTag), 12);
 
-  return { ciphertext, iv, tag };
+  return { encryptedBody: result };
 }
 
-// AES-256-GCM decryption
+// AES-256-GCM decryption - expects IV || ciphertext || tag
 export async function aesGcmDecrypt(
   key: Uint8Array,
-  iv: Uint8Array,
   aad: Uint8Array,
-  ciphertext: Uint8Array,
-  tag: Uint8Array
+  encryptedBody: Uint8Array
 ): Promise<Uint8Array> {
+  // Extract IV (first 12 bytes) and ciphertext+tag (rest)
+  const iv = encryptedBody.slice(0, 12);
+  const ciphertextWithTag = encryptedBody.slice(12);
+
   const aesKey = await cryptoSubtle.importKey(
     'raw',
     key,
@@ -131,10 +134,6 @@ export async function aesGcmDecrypt(
     false,
     ['decrypt']
   );
-
-  const ciphertextWithTag = new Uint8Array(ciphertext.length + tag.length);
-  ciphertextWithTag.set(ciphertext);
-  ciphertextWithTag.set(tag, ciphertext.length);
 
   const plaintext = await cryptoSubtle.decrypt(
     {

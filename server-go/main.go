@@ -146,12 +146,6 @@ func generateSessionID(prefix string) string {
 	return fmt.Sprintf("%s-%s", prefix, hex.EncodeToString(b))
 }
 
-func generateIV() []byte {
-	iv := make([]byte, 12)
-	rand.Read(iv)
-	return iv
-}
-
 func generateRandomHex(n int) string {
 	b := make([]byte, n)
 	rand.Read(b)
@@ -168,31 +162,35 @@ func hkdf32(sharedSecret, salt, info []byte) ([]byte, error) {
 	return key, nil
 }
 
-// AES-256-GCM encryption
-func aesGcmEncrypt(key, iv, aad, plaintext []byte) (ciphertext, tag []byte, err error) {
+// AES-256-GCM encryption - returns IV || ciphertext || tag
+func aesGcmEncrypt(key, aad, plaintext []byte) ([]byte, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	aesgcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	// Encrypt and append tag
+	// Generate random IV
+	iv := make([]byte, 12)
+	rand.Read(iv)
+
+	// Encrypt (returns ciphertext || tag)
 	sealed := aesgcm.Seal(nil, iv, plaintext, aad)
 
-	// Split ciphertext and tag (tag is last 16 bytes)
-	tagSize := aesgcm.Overhead()
-	ciphertext = sealed[:len(sealed)-tagSize]
-	tag = sealed[len(sealed)-tagSize:]
-
-	return ciphertext, tag, nil
+	// Return IV || ciphertext || tag
+	return append(iv, sealed...), nil
 }
 
-// AES-256-GCM decryption
-func aesGcmDecrypt(key, iv, aad, ciphertext, tag []byte) ([]byte, error) {
+// AES-256-GCM decryption - expects IV || ciphertext || tag
+func aesGcmDecrypt(key, aad, data []byte) ([]byte, error) {
+	if len(data) < 28 { // 12 (IV) + 16 (tag) minimum
+		return nil, fmt.Errorf("INVALID_DATA_LENGTH")
+	}
+
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
@@ -203,9 +201,11 @@ func aesGcmDecrypt(key, iv, aad, ciphertext, tag []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	// Combine ciphertext and tag for Open()
-	sealed := append(ciphertext, tag...)
-	plaintext, err := aesgcm.Open(nil, iv, sealed, aad)
+	// Extract IV and ciphertext+tag
+	iv := data[:12]
+	ciphertextWithTag := data[12:]
+
+	plaintext, err := aesgcm.Open(nil, iv, ciphertextWithTag, aad)
 	if err != nil {
 		return nil, err
 	}
@@ -313,14 +313,22 @@ func sessionInitHandler(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Server-Timing", metrics.ToServerTimingHeader())
 	}()
 
-	nonce := r.Header.Get("X-Nonce")
-	timestamp := r.Header.Get("X-Timestamp")
+	idempotencyKey := r.Header.Get("X-Idempotency-Key")
 	clientId := r.Header.Get("X-ClientId")
 
-	if nonce == "" || timestamp == "" || clientId == "" {
+	if idempotencyKey == "" || clientId == "" {
 		sendError(w, http.StatusBadRequest, "CRYPTO_ERROR")
 		return
 	}
+
+	// Parse X-Idempotency-Key: timestamp.nonce
+	parts := strings.Split(idempotencyKey, ".")
+	if len(parts) != 2 {
+		sendError(w, http.StatusBadRequest, "CRYPTO_ERROR")
+		return
+	}
+	timestamp := parts[0]
+	nonce := parts[1]
 
 	// Replay protection
 	var replayErr error
@@ -434,25 +442,24 @@ func transactionPurchaseHandler(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Server-Timing", metrics.ToServerTimingHeader())
 	}()
 
-	// Extract encryption headers
+	// Extract headers
 	kid := r.Header.Get("X-Kid")
-	encAlg := r.Header.Get("X-Enc-Alg")
-	ivB64 := r.Header.Get("X-IV")
-	tagB64 := r.Header.Get("X-Tag")
-	aadB64 := r.Header.Get("X-AAD")
-	nonce := r.Header.Get("X-Nonce")
-	timestamp := r.Header.Get("X-Timestamp")
+	idempotencyKey := r.Header.Get("X-Idempotency-Key")
 	clientId := r.Header.Get("X-ClientId")
 
-	if kid == "" || encAlg == "" || ivB64 == "" || tagB64 == "" || aadB64 == "" || nonce == "" || timestamp == "" || clientId == "" {
+	if kid == "" || idempotencyKey == "" || clientId == "" {
 		sendError(w, http.StatusBadRequest, "CRYPTO_ERROR")
 		return
 	}
 
-	if encAlg != "A256GCM" {
+	// Parse X-Idempotency-Key: timestamp.nonce
+	parts := strings.Split(idempotencyKey, ".")
+	if len(parts) != 2 {
 		sendError(w, http.StatusBadRequest, "CRYPTO_ERROR")
 		return
 	}
+	timestamp := parts[0]
+	nonce := parts[1]
 
 	// Replay protection
 	var replayErr error
@@ -487,46 +494,22 @@ func transactionPurchaseHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Decode crypto components
-	iv, err := b64Decode(ivB64)
-	if err != nil || len(iv) != 12 {
-		sendError(w, http.StatusBadRequest, "CRYPTO_ERROR")
-		return
-	}
-
-	tag, err := b64Decode(tagB64)
-	if err != nil || len(tag) != 16 {
-		sendError(w, http.StatusBadRequest, "CRYPTO_ERROR")
-		return
-	}
-
-	aad, err := b64Decode(aadB64)
-	if err != nil {
-		sendError(w, http.StatusBadRequest, "CRYPTO_ERROR")
-		return
-	}
-
-	// Read body (base64-encoded ciphertext)
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		sendError(w, http.StatusBadRequest, "CRYPTO_ERROR")
-		return
-	}
-
-	ciphertext, err := b64Decode(string(body))
-	if err != nil {
-		sendError(w, http.StatusBadRequest, "CRYPTO_ERROR")
-		return
-	}
-
-	// Rebuild expected AAD and verify
+	// Build AAD from headers (server reconstructs it)
 	// AAD format: TIMESTAMP|NONCE|KID|CLIENTID
-	var expectedAAD []byte
-	metrics.Measure("aad-validation", func() {
-		expectedAAD = buildAAD(timestamp, nonce, kid, clientId)
+	var aad []byte
+	metrics.Measure("aad-build", func() {
+		aad = buildAAD(timestamp, nonce, kid, clientId)
 	})
-	if string(aad) != string(expectedAAD) {
-		log.Printf("AAD mismatch")
+
+	// Read encrypted body (IV || ciphertext || tag)
+	encryptedBody, err := io.ReadAll(r.Body)
+	if err != nil {
+		sendError(w, http.StatusBadRequest, "CRYPTO_ERROR")
+		return
+	}
+
+	// Minimum length: IV (12) + tag (16) = 28 bytes
+	if len(encryptedBody) < 28 {
 		sendError(w, http.StatusBadRequest, "CRYPTO_ERROR")
 		return
 	}
@@ -538,11 +521,11 @@ func transactionPurchaseHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Decrypt request body
+	// Decrypt request body (body contains IV || ciphertext || tag)
 	var plaintext []byte
 	var decryptErr error
 	metrics.MeasureResult("aes-gcm-decrypt", func() error {
-		plaintext, decryptErr = aesGcmDecrypt(sessionKey, iv, aad, ciphertext, tag)
+		plaintext, decryptErr = aesGcmDecrypt(sessionKey, aad, encryptedBody)
 		return decryptErr
 	})
 	if decryptErr != nil {
@@ -573,30 +556,26 @@ func transactionPurchaseHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Encrypt response
 	responsePlaintext, _ := json.Marshal(responseData)
-	responseIV := generateIV()
 	responseNonce := uuid.New().String()
 	responseTimestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
+	responseIdempotencyKey := fmt.Sprintf("%s.%s", responseTimestamp, responseNonce)
 
 	// Build response AAD
 	// AAD format: TIMESTAMP|NONCE|KID|CLIENTID
 	responseAAD := buildAAD(responseTimestamp, responseNonce, kid, clientId)
 
-	var responseCiphertext, responseTag []byte
+	// Encrypt - returns IV || ciphertext || tag
+	var encryptedResponse []byte
 	metrics.Measure("aes-gcm-encrypt", func() {
-		responseCiphertext, responseTag, _ = aesGcmEncrypt(sessionKey, responseIV, responseAAD, responsePlaintext)
+		encryptedResponse, _ = aesGcmEncrypt(sessionKey, responseAAD, responsePlaintext)
 	})
 
 	// Set response headers
 	w.Header().Set("X-Kid", kid)
-	w.Header().Set("X-Enc-Alg", "A256GCM")
-	w.Header().Set("X-IV", b64Encode(responseIV))
-	w.Header().Set("X-Tag", b64Encode(responseTag))
-	w.Header().Set("X-AAD", b64Encode(responseAAD))
-	w.Header().Set("X-Nonce", responseNonce)
-	w.Header().Set("X-Timestamp", responseTimestamp)
+	w.Header().Set("X-Idempotency-Key", responseIdempotencyKey)
 	w.Header().Set("Content-Type", "application/octet-stream")
 
-	w.Write([]byte(b64Encode(responseCiphertext)))
+	w.Write(encryptedResponse)
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
@@ -633,8 +612,8 @@ func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Nonce, X-Timestamp, X-ClientId, X-Kid, X-Enc-Alg, X-IV, X-Tag, X-AAD")
-		w.Header().Set("Access-Control-Expose-Headers", "Server-Timing, X-Kid, X-Enc-Alg, X-IV, X-Tag, X-AAD")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Idempotency-Key, X-ClientId, X-Kid")
+		w.Header().Set("Access-Control-Expose-Headers", "Server-Timing, X-Kid, X-Idempotency-Key")
 
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusOK)

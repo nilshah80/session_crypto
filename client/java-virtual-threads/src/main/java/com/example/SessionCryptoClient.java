@@ -193,11 +193,11 @@ public class SessionCryptoClient {
 
         String nonce = UUID.randomUUID().toString();
         String timestamp = String.valueOf(System.currentTimeMillis());
+        String requestId = timestamp + "." + nonce;
 
         if (verbose) {
             System.out.println("\n  📤 Sending POST /session/init");
-            System.out.println("     X-Nonce: " + nonce);
-            System.out.println("     X-Timestamp: " + timestamp);
+            System.out.println("     X-Idempotency-Key: " + requestId);
             System.out.println("     X-ClientId: " + CLIENT_ID);
         }
 
@@ -209,8 +209,7 @@ public class SessionCryptoClient {
         HttpRequest request = HttpRequest.newBuilder()
             .uri(URI.create(SERVER_URL + "/session/init"))
             .header("Content-Type", "application/json")
-            .header("X-Nonce", nonce)
-            .header("X-Timestamp", timestamp)
+            .header("X-Idempotency-Key", requestId)
             .header("X-ClientId", CLIENT_ID)
             .POST(HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(requestBody)))
             .build();
@@ -301,11 +300,10 @@ public class SessionCryptoClient {
             System.out.println("     " + mapper.writeValueAsString(purchaseData));
         }
 
-        // Generate IV and nonce
-        byte[] iv = new byte[12];
-        secureRandom.nextBytes(iv);
+        // Generate nonce and timestamp for replay protection
         String nonce = UUID.randomUUID().toString();
         String timestamp = String.valueOf(System.currentTimeMillis());
+        String requestId = timestamp + "." + nonce;
 
         // Build AAD
         // Format: TIMESTAMP|NONCE|KID|CLIENTID
@@ -314,14 +312,16 @@ public class SessionCryptoClient {
 
         if (verbose) {
             System.out.println("\n  🔒 Encrypting request...");
-            System.out.println("     IV (base64): " + Base64.getEncoder().encodeToString(iv));
             System.out.println("     AAD: " + timestamp + "|" +
                 nonce.substring(0, 8) + "...|session:" + session.sessionId.substring(0, 8) + "...|" + session.clientId);
         }
 
-        // Encrypt with AES-256-GCM
-        byte[][] encResult = measureSync("aes-gcm-encrypt", cryptoOps, () -> {
+        // Encrypt with AES-256-GCM - returns IV || ciphertext || tag
+        byte[] encryptedBody = measureSync("aes-gcm-encrypt", cryptoOps, () -> {
             try {
+                byte[] iv = new byte[12];
+                secureRandom.nextBytes(iv);
+
                 Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
                 SecretKeySpec keySpec = new SecretKeySpec(session.sessionKey, "AES");
                 GCMParameterSpec gcmSpec = new GCMParameterSpec(128, iv);
@@ -329,23 +329,18 @@ public class SessionCryptoClient {
                 cipher.updateAAD(aad);
                 byte[] ciphertextWithTag = cipher.doFinal(plaintext);
 
-                // Split ciphertext and tag (tag is last 16 bytes)
-                byte[] ciphertext = new byte[ciphertextWithTag.length - 16];
-                byte[] tag = new byte[16];
-                System.arraycopy(ciphertextWithTag, 0, ciphertext, 0, ciphertext.length);
-                System.arraycopy(ciphertextWithTag, ciphertext.length, tag, 0, 16);
-                return new byte[][] { ciphertext, tag };
+                // Concatenate: IV (12) || ciphertext || tag (already appended by Java)
+                byte[] result = new byte[12 + ciphertextWithTag.length];
+                System.arraycopy(iv, 0, result, 0, 12);
+                System.arraycopy(ciphertextWithTag, 0, result, 12, ciphertextWithTag.length);
+                return result;
             } catch (Exception e) {
                 throw new RuntimeException(e);
             }
         });
 
-        byte[] ciphertext = encResult[0];
-        byte[] tag = encResult[1];
-
         if (verbose) {
-            System.out.println("     Ciphertext length: " + ciphertext.length + " bytes");
-            System.out.println("     Auth tag (base64): " + Base64.getEncoder().encodeToString(tag));
+            System.out.println("     Encrypted body length: " + encryptedBody.length + " bytes (IV + ciphertext + tag)");
             System.out.println("\n  📤 Sending encrypted POST /transaction/purchase");
         }
 
@@ -353,56 +348,59 @@ public class SessionCryptoClient {
             .uri(URI.create(SERVER_URL + "/transaction/purchase"))
             .header("Content-Type", "application/octet-stream")
             .header("X-Kid", session.kid)
-            .header("X-Enc-Alg", "A256GCM")
-            .header("X-IV", Base64.getEncoder().encodeToString(iv))
-            .header("X-Tag", Base64.getEncoder().encodeToString(tag))
-            .header("X-AAD", Base64.getEncoder().encodeToString(aad))
-            .header("X-Nonce", nonce)
-            .header("X-Timestamp", timestamp)
+            .header("X-Idempotency-Key", requestId)
             .header("X-ClientId", session.clientId)
-            .POST(HttpRequest.BodyPublishers.ofString(Base64.getEncoder().encodeToString(ciphertext)))
+            .POST(HttpRequest.BodyPublishers.ofByteArray(encryptedBody))
             .build();
 
         long httpStart = System.nanoTime();
-        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+        HttpResponse<byte[]> response = httpClient.send(request, HttpResponse.BodyHandlers.ofByteArray());
         double httpMs = (System.nanoTime() - httpStart) / 1_000_000.0;
 
         if (response.statusCode() != 200) {
-            throw new RuntimeException("Purchase failed: " + response.statusCode() + " - " + response.body());
+            throw new RuntimeException("Purchase failed: " + response.statusCode() + " - " + new String(response.body()));
         }
 
         String serverTiming = response.headers().firstValue("Server-Timing").orElse(null);
 
+        // Extract response headers
+        String respKid = response.headers().firstValue("X-Kid").orElseThrow();
+        String respRequestId = response.headers().firstValue("X-Idempotency-Key").orElseThrow();
+
         if (verbose) {
             System.out.println("\n  📥 Received encrypted response (status: " + response.statusCode() + ")");
+            System.out.println("     Response headers:");
+            System.out.println("       X-Kid: " + respKid);
+            System.out.println("       X-Idempotency-Key: " + respRequestId.substring(0, Math.min(30, respRequestId.length())) + "...");
         }
 
-        // Extract response headers
-        String respIvB64 = response.headers().firstValue("X-IV").orElseThrow();
-        String respTagB64 = response.headers().firstValue("X-Tag").orElseThrow();
-        String respAadB64 = response.headers().firstValue("X-AAD").orElseThrow();
+        // Parse response request ID to get timestamp and nonce for AAD reconstruction
+        String[] respParts = respRequestId.split("\\.");
+        if (respParts.length != 2) {
+            throw new RuntimeException("Invalid X-Idempotency-Key format in response");
+        }
+        String respTimestamp = respParts[0];
+        String respNonce = respParts[1];
+
+        // Reconstruct AAD from response headers
+        byte[] respAad = (respTimestamp + "|" + respNonce + "|" + respKid + "|" + session.clientId)
+            .getBytes(StandardCharsets.UTF_8);
+
+        // Get encrypted body (IV || ciphertext || tag)
+        byte[] respEncryptedBody = response.body();
 
         if (verbose) {
-            System.out.println("     Response headers:");
-            System.out.println("       X-Kid: " + response.headers().firstValue("X-Kid").orElse(""));
-            System.out.println("       X-Enc-Alg: " + response.headers().firstValue("X-Enc-Alg").orElse(""));
-            System.out.println("       X-IV: " + respIvB64.substring(0, 16) + "...");
-            System.out.println("       X-Tag: " + respTagB64.substring(0, 20) + "...");
+            System.out.println("     Encrypted body length: " + respEncryptedBody.length + " bytes");
             System.out.println("\n  🔓 Decrypting response...");
         }
 
-        // Decode and decrypt response
-        byte[] respIv = Base64.getDecoder().decode(respIvB64);
-        byte[] respTag = Base64.getDecoder().decode(respTagB64);
-        byte[] respAad = Base64.getDecoder().decode(respAadB64);
-        byte[] respCiphertext = Base64.getDecoder().decode(response.body());
-
         byte[] respPlaintext = measureSync("aes-gcm-decrypt", cryptoOps, () -> {
             try {
-                // Combine ciphertext and tag for decryption
-                byte[] respCiphertextWithTag = new byte[respCiphertext.length + respTag.length];
-                System.arraycopy(respCiphertext, 0, respCiphertextWithTag, 0, respCiphertext.length);
-                System.arraycopy(respTag, 0, respCiphertextWithTag, respCiphertext.length, respTag.length);
+                // Extract IV (first 12 bytes) and ciphertext+tag (rest)
+                byte[] respIv = new byte[12];
+                System.arraycopy(respEncryptedBody, 0, respIv, 0, 12);
+                byte[] respCiphertextWithTag = new byte[respEncryptedBody.length - 12];
+                System.arraycopy(respEncryptedBody, 12, respCiphertextWithTag, 0, respCiphertextWithTag.length);
 
                 Cipher decCipher = Cipher.getInstance("AES/GCM/NoPadding");
                 SecretKeySpec decKeySpec = new SecretKeySpec(session.sessionKey, "AES");

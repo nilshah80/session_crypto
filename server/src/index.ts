@@ -13,7 +13,6 @@ import {
   aesGcmDecrypt,
   aesGcmEncrypt,
   buildAad,
-  generateIv,
   generateSessionId,
 } from "./crypto-helpers.js";
 import { storeSession, getSession, initSessionStore } from "./session-store.js";
@@ -58,29 +57,21 @@ await fastify.register(cors, {
   methods: ["GET", "POST", "OPTIONS"],
   allowedHeaders: [
     "Content-Type",
-    "X-Nonce",
-    "X-Timestamp",
+    "X-Idempotency-Key",
     "X-ClientId",
     "X-Kid",
-    "X-Enc-Alg",
-    "X-IV",
-    "X-Tag",
-    "X-AAD",
   ],
   exposedHeaders: [
     "Server-Timing",
     "X-Kid",
-    "X-Enc-Alg",
-    "X-IV",
-    "X-Tag",
-    "X-AAD",
+    "X-Idempotency-Key",
   ],
 });
 
 // Add content type parser for raw/octet-stream bodies
 fastify.addContentTypeParser(
   "application/octet-stream",
-  { parseAs: "string" },
+  { parseAs: "buffer" },
   (_req, body, done) => {
     done(null, body);
   }
@@ -123,12 +114,17 @@ fastify.post<{
   Body: SessionInitBody;
   Reply: SessionInitResponse | { error: string };
 }>("/session/init", async (request, reply) => {
-  const nonce = request.headers["x-nonce"] as string | undefined;
-  const timestamp = request.headers["x-timestamp"] as string | undefined;
+  const idempotencyKey = request.headers["x-idempotency-key"] as string | undefined;
   const clientId = request.headers["x-clientid"] as string | undefined;
 
   // Validate required headers
-  if (!nonce || !timestamp || !clientId) {
+  if (!idempotencyKey || !clientId) {
+    return reply.status(400).send({ error: "CRYPTO_ERROR" });
+  }
+
+  // Parse X-Idempotency-Key: timestamp.nonce
+  const [timestamp, nonce] = idempotencyKey.split(".");
+  if (!timestamp || !nonce) {
     return reply.status(400).send({ error: "CRYPTO_ERROR" });
   }
 
@@ -204,23 +200,19 @@ fastify.post<{
 
 // POST /transaction/purchase - Encrypted business endpoint
 fastify.post("/transaction/purchase", async (request, reply) => {
-  // Extract encryption headers
+  // Extract headers
   const kid = request.headers["x-kid"] as string | undefined;
-  const encAlg = request.headers["x-enc-alg"] as string | undefined;
-  const ivB64 = request.headers["x-iv"] as string | undefined;
-  const tagB64 = request.headers["x-tag"] as string | undefined;
-  const aadB64 = request.headers["x-aad"] as string | undefined;
-  const nonce = request.headers["x-nonce"] as string | undefined;
-  const timestamp = request.headers["x-timestamp"] as string | undefined;
+  const idempotencyKey = request.headers["x-idempotency-key"] as string | undefined;
   const clientId = request.headers["x-clientid"] as string | undefined;
 
   // Validate all required headers
-  if (!kid || !encAlg || !ivB64 || !tagB64 || !aadB64 || !nonce || !timestamp || !clientId) {
+  if (!kid || !idempotencyKey || !clientId) {
     return reply.status(400).send({ error: "CRYPTO_ERROR" });
   }
 
-  // Validate encryption algorithm
-  if (encAlg !== "A256GCM") {
+  // Parse X-Idempotency-Key: timestamp.nonce
+  const [timestamp, nonce] = idempotencyKey.split(".");
+  if (!timestamp || !nonce) {
     return reply.status(400).send({ error: "CRYPTO_ERROR" });
   }
 
@@ -248,41 +240,33 @@ fastify.post("/transaction/purchase", async (request, reply) => {
     return reply.status(401).send({ error: "SESSION_EXPIRED" });
   }
 
-  // Decode crypto components
-  let iv: Buffer, tag: Buffer, aad: Buffer, ciphertext: Buffer;
-  try {
-    iv = unb64(ivB64);
-    tag = unb64(tagB64);
-    aad = unb64(aadB64);
-
-    // Validate IV and tag lengths
-    if (iv.length !== 12) throw new Error("INVALID_IV_LENGTH");
-    if (tag.length !== 16) throw new Error("INVALID_TAG_LENGTH");
-
-    // Get ciphertext from body (raw buffer)
-    const rawBody = request.body as Buffer | string;
-    ciphertext =
-      typeof rawBody === "string" ? unb64(rawBody) : Buffer.from(rawBody);
-  } catch (e) {
-    request.log.warn({ error: e }, "Failed to decode crypto components");
-    return reply.status(400).send({ error: "CRYPTO_ERROR" });
-  }
-
-  // Rebuild expected AAD and verify it matches
+  // Build AAD from headers (server reconstructs it)
   // AAD format: TIMESTAMP|NONCE|KID|CLIENTID
-  const expectedAad = request.metrics!.measure("aad-validation", () =>
+  const aad = request.metrics!.measure("aad-build", () =>
     buildAad(timestamp, nonce, kid, clientId)
   );
-  if (!aad.equals(expectedAad)) {
-    request.log.warn("AAD mismatch");
+
+  // Get encrypted body (IV || ciphertext || tag)
+  let encryptedBody: Buffer;
+  try {
+    const rawBody = request.body as Buffer | string;
+    encryptedBody =
+      typeof rawBody === "string" ? Buffer.from(rawBody) : Buffer.from(rawBody);
+
+    // Minimum length: IV (12) + tag (16) = 28 bytes
+    if (encryptedBody.length < 28) {
+      throw new Error("INVALID_BODY_LENGTH");
+    }
+  } catch (e) {
+    request.log.warn({ error: e }, "Failed to read encrypted body");
     return reply.status(400).send({ error: "CRYPTO_ERROR" });
   }
 
-  // Decrypt request body
+  // Decrypt request body (body contains IV || ciphertext || tag)
   let plaintext: Buffer;
   try {
     plaintext = request.metrics!.measure("aes-gcm-decrypt", () =>
-      aesGcmDecrypt(session.key, iv, aad, ciphertext, tag)
+      aesGcmDecrypt(session.key, aad, encryptedBody)
     );
   } catch (e) {
     request.log.warn({ error: e }, "Decryption failed");
@@ -314,9 +298,9 @@ fastify.post("/transaction/purchase", async (request, reply) => {
 
   // Encrypt response
   const responsePlaintext = Buffer.from(JSON.stringify(responseData), "utf8");
-  const responseIv = generateIv();
   const responseNonce = crypto.randomUUID();
   const responseTimestamp = Date.now().toString();
+  const responseIdempotencyKey = `${responseTimestamp}.${responseNonce}`;
 
   // Build response AAD
   // AAD format: TIMESTAMP|NONCE|KID|CLIENTID
@@ -327,22 +311,17 @@ fastify.post("/transaction/purchase", async (request, reply) => {
     clientId
   );
 
-  const { ciphertext: responseCiphertext, tag: responseTag } =
-    request.metrics!.measure("aes-gcm-encrypt", () =>
-      aesGcmEncrypt(session.key, responseIv, responseAad, responsePlaintext)
-    );
+  // Encrypt - returns IV || ciphertext || tag
+  const encryptedResponse = request.metrics!.measure("aes-gcm-encrypt", () =>
+    aesGcmEncrypt(session.key, responseAad, responsePlaintext)
+  );
 
   // Set response headers
   reply.header("X-Kid", kid);
-  reply.header("X-Enc-Alg", "A256GCM");
-  reply.header("X-IV", b64(responseIv));
-  reply.header("X-Tag", b64(responseTag));
-  reply.header("X-AAD", b64(responseAad));
-  reply.header("X-Nonce", responseNonce);
-  reply.header("X-Timestamp", responseTimestamp);
+  reply.header("X-Idempotency-Key", responseIdempotencyKey);
   reply.header("Content-Type", "application/octet-stream");
 
-  return reply.send(b64(responseCiphertext));
+  return reply.send(encryptedResponse);
 });
 
 // Health check

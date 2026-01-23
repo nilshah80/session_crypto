@@ -63,3 +63,5 @@ target/
 
 # Go client binary (alternate name)
 client/go/go-client
+client/go/client
+server-go/server

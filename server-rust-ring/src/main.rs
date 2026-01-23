@@ -1,4 +1,5 @@
 use axum::{
+    body::Bytes,
     extract::State,
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
@@ -277,32 +278,44 @@ fn hkdf32(shared_secret: &[u8], salt_bytes: &[u8], info: &[u8]) -> Vec<u8> {
     key
 }
 
-// AES-256-GCM encryption
+// AES-256-GCM encryption - returns IV || ciphertext || tag
 fn aes_gcm_encrypt(
     key: &[u8],
-    iv: &[u8; 12],
     aad: &[u8],
     plaintext: &[u8],
-) -> Result<(Vec<u8>, Vec<u8>), ring::error::Unspecified> {
+    rng: &SystemRandom,
+) -> Result<Vec<u8>, ring::error::Unspecified> {
+    let iv = generate_iv(rng);
     let unbound_key = aead::UnboundKey::new(&aead::AES_256_GCM, key)?;
-    let mut sealing_key = aead::SealingKey::new(unbound_key, SingleUseNonce(Some(*iv)));
+    let mut sealing_key = aead::SealingKey::new(unbound_key, SingleUseNonce(Some(iv)));
 
     let mut in_out = plaintext.to_vec();
     let tag = sealing_key.seal_in_place_separate_tag(Aad::from(aad), &mut in_out)?;
 
-    Ok((in_out, tag.as_ref().to_vec()))
+    // Return IV || ciphertext || tag
+    let mut result = Vec::with_capacity(12 + in_out.len() + 16);
+    result.extend_from_slice(&iv);
+    result.extend_from_slice(&in_out);
+    result.extend_from_slice(tag.as_ref());
+    Ok(result)
 }
 
-// AES-256-GCM decryption
+// AES-256-GCM decryption - expects IV || ciphertext || tag
 fn aes_gcm_decrypt(
     key: &[u8],
-    iv: &[u8; 12],
     aad: &[u8],
-    ciphertext: &[u8],
-    tag: &[u8],
+    encrypted_body: &[u8],
 ) -> Result<Vec<u8>, ring::error::Unspecified> {
+    if encrypted_body.len() < 12 + 16 {
+        return Err(ring::error::Unspecified);
+    }
+
+    let iv: [u8; 12] = encrypted_body[..12].try_into().unwrap();
+    let ciphertext = &encrypted_body[12..encrypted_body.len() - 16];
+    let tag = &encrypted_body[encrypted_body.len() - 16..];
+
     let unbound_key = aead::UnboundKey::new(&aead::AES_256_GCM, key)?;
-    let mut opening_key = aead::OpeningKey::new(unbound_key, SingleUseNonce(Some(*iv)));
+    let mut opening_key = aead::OpeningKey::new(unbound_key, SingleUseNonce(Some(iv)));
 
     let mut in_out = Vec::with_capacity(ciphertext.len() + tag.len());
     in_out.extend_from_slice(ciphertext);
@@ -415,12 +428,8 @@ async fn session_init_handler(
 ) -> impl IntoResponse {
     let mut metrics = MetricsCollector::new();
 
-    let nonce = headers
-        .get("x-nonce")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let timestamp = headers
-        .get("x-timestamp")
+    let idempotency_key = headers
+        .get("x-idempotency-key")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let client_id = headers
@@ -428,9 +437,17 @@ async fn session_init_handler(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    if nonce.is_empty() || timestamp.is_empty() || client_id.is_empty() {
+    if idempotency_key.is_empty() || client_id.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "CRYPTO_ERROR", &metrics);
     }
+
+    // Parse X-Idempotency-Key: timestamp.nonce
+    let parts: Vec<&str> = idempotency_key.split('.').collect();
+    if parts.len() != 2 {
+        return error_response(StatusCode::BAD_REQUEST, "CRYPTO_ERROR", &metrics);
+    }
+    let timestamp = parts[0];
+    let nonce = parts[1];
 
     // Replay protection
     {
@@ -528,37 +545,17 @@ async fn session_init_handler(
 async fn transaction_purchase_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    body: String,
+    body: Bytes,
 ) -> impl IntoResponse {
     let mut metrics = MetricsCollector::new();
 
-    // Extract encryption headers
+    // Extract headers
     let kid = headers
         .get("x-kid")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let enc_alg = headers
-        .get("x-enc-alg")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let iv_b64 = headers
-        .get("x-iv")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let tag_b64 = headers
-        .get("x-tag")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let aad_b64 = headers
-        .get("x-aad")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let nonce = headers
-        .get("x-nonce")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let timestamp = headers
-        .get("x-timestamp")
+    let idempotency_key = headers
+        .get("x-idempotency-key")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let client_id = headers
@@ -566,21 +563,17 @@ async fn transaction_purchase_handler(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    if kid.is_empty()
-        || enc_alg.is_empty()
-        || iv_b64.is_empty()
-        || tag_b64.is_empty()
-        || aad_b64.is_empty()
-        || nonce.is_empty()
-        || timestamp.is_empty()
-        || client_id.is_empty()
-    {
+    if kid.is_empty() || idempotency_key.is_empty() || client_id.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "CRYPTO_ERROR", &metrics);
     }
 
-    if enc_alg != "A256GCM" {
+    // Parse X-Idempotency-Key: timestamp.nonce
+    let parts: Vec<&str> = idempotency_key.split('.').collect();
+    if parts.len() != 2 {
         return error_response(StatusCode::BAD_REQUEST, "CRYPTO_ERROR", &metrics);
     }
+    let timestamp = parts[0];
+    let nonce = parts[1];
 
     // Replay protection
     {
@@ -619,47 +612,19 @@ async fn transaction_purchase_handler(
         }
     };
 
-    // Decode crypto components
-    let iv = match b64_decode(iv_b64) {
-        Ok(v) if v.len() == 12 => v,
-        _ => return error_response(StatusCode::BAD_REQUEST, "CRYPTO_ERROR", &metrics),
-    };
-
-    let tag = match b64_decode(tag_b64) {
-        Ok(v) if v.len() == 16 => v,
-        _ => return error_response(StatusCode::BAD_REQUEST, "CRYPTO_ERROR", &metrics),
-    };
-
-    let aad = match b64_decode(aad_b64) {
-        Ok(v) => v,
-        Err(_) => return error_response(StatusCode::BAD_REQUEST, "CRYPTO_ERROR", &metrics),
-    };
-
-    let ciphertext = match b64_decode(&body) {
-        Ok(v) => v,
-        Err(_) => return error_response(StatusCode::BAD_REQUEST, "CRYPTO_ERROR", &metrics),
-    };
-
-    // Rebuild expected AAD and verify
-    // AAD format: TIMESTAMP|NONCE|KID|CLIENTID
-    let expected_aad =
-        metrics.measure("aad-validation", || build_aad(timestamp, nonce, kid, client_id));
-
-    if aad != expected_aad {
-        warn!("AAD mismatch");
-        return error_response(StatusCode::BAD_REQUEST, "CRYPTO_ERROR", &metrics);
-    }
-
     // Decode session key
     let session_key = match b64_decode(&session.key) {
         Ok(v) => v,
         Err(_) => return error_response(StatusCode::BAD_REQUEST, "CRYPTO_ERROR", &metrics),
     };
 
-    // Decrypt request body
-    let iv_array: [u8; 12] = iv.try_into().unwrap();
+    // Build expected AAD
+    // AAD format: TIMESTAMP|NONCE|KID|CLIENTID
+    let aad = metrics.measure("aad-build", || build_aad(timestamp, nonce, kid, client_id));
+
+    // Decrypt request body (IV || ciphertext || tag)
     let plaintext = match metrics.measure("aes-gcm-decrypt", || {
-        aes_gcm_decrypt(&session_key, &iv_array, &aad, &ciphertext, &tag)
+        aes_gcm_decrypt(&session_key, &aad, &body)
     }) {
         Ok(p) => p,
         Err(_) => {
@@ -694,41 +659,25 @@ async fn transaction_purchase_handler(
 
     // Encrypt response
     let response_plaintext = serde_json::to_vec(&response_data).unwrap();
-    let response_iv = generate_iv(&state.rng);
     let response_nonce = uuid::Uuid::new_v4().to_string();
     let response_timestamp = current_timestamp_ms().to_string();
+    let response_idempotency_key = format!("{}.{}", response_timestamp, response_nonce);
 
     // Build response AAD
     // AAD format: TIMESTAMP|NONCE|KID|CLIENTID
     let response_aad = build_aad(&response_timestamp, &response_nonce, kid, client_id);
 
-    let (response_ciphertext, response_tag) = metrics.measure("aes-gcm-encrypt", || {
-        aes_gcm_encrypt(&session_key, &response_iv, &response_aad, &response_plaintext).unwrap()
+    // Encrypt - returns IV || ciphertext || tag
+    let encrypted_response = metrics.measure("aes-gcm-encrypt", || {
+        aes_gcm_encrypt(&session_key, &response_aad, &response_plaintext, &state.rng).unwrap()
     });
 
     // Build response with headers
     let mut response_headers = HeaderMap::new();
     response_headers.insert("X-Kid", HeaderValue::from_str(kid).unwrap());
-    response_headers.insert("X-Enc-Alg", HeaderValue::from_static("A256GCM"));
     response_headers.insert(
-        "X-IV",
-        HeaderValue::from_str(&b64_encode(&response_iv)).unwrap(),
-    );
-    response_headers.insert(
-        "X-Tag",
-        HeaderValue::from_str(&b64_encode(&response_tag)).unwrap(),
-    );
-    response_headers.insert(
-        "X-AAD",
-        HeaderValue::from_str(&b64_encode(&response_aad)).unwrap(),
-    );
-    response_headers.insert(
-        "X-Nonce",
-        HeaderValue::from_str(&response_nonce).unwrap(),
-    );
-    response_headers.insert(
-        "X-Timestamp",
-        HeaderValue::from_str(&response_timestamp).unwrap(),
+        "X-Idempotency-Key",
+        HeaderValue::from_str(&response_idempotency_key).unwrap(),
     );
     response_headers.insert("Content-Type", HeaderValue::from_static("application/octet-stream"));
     response_headers.insert(
@@ -736,7 +685,7 @@ async fn transaction_purchase_handler(
         HeaderValue::from_str(&metrics.to_server_timing_header()).unwrap(),
     );
 
-    (StatusCode::OK, response_headers, b64_encode(&response_ciphertext)).into_response()
+    (StatusCode::OK, response_headers, encrypted_response).into_response()
 }
 
 async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -839,22 +788,14 @@ async fn main() {
         .allow_methods(Any)
         .allow_headers([
             "content-type".parse().unwrap(),
-            "x-nonce".parse().unwrap(),
-            "x-timestamp".parse().unwrap(),
+            "x-idempotency-key".parse().unwrap(),
             "x-clientid".parse().unwrap(),
             "x-kid".parse().unwrap(),
-            "x-enc-alg".parse().unwrap(),
-            "x-iv".parse().unwrap(),
-            "x-tag".parse().unwrap(),
-            "x-aad".parse().unwrap(),
         ])
         .expose_headers([
             "server-timing".parse().unwrap(),
             "x-kid".parse().unwrap(),
-            "x-enc-alg".parse().unwrap(),
-            "x-iv".parse().unwrap(),
-            "x-tag".parse().unwrap(),
-            "x-aad".parse().unwrap(),
+            "x-idempotency-key".parse().unwrap(),
         ]);
 
     // Build router
@@ -868,7 +809,7 @@ async fn main() {
 
     // Start server
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    info!("Server listening on http://localhost:3000");
+    info!("Server listening on http://localhost:3000 (ring)");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

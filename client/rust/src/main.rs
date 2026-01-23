@@ -352,11 +352,11 @@ async fn init_session(
         .duration_since(UNIX_EPOCH)?
         .as_millis()
         .to_string();
+    let request_id = format!("{}.{}", timestamp, nonce);
 
     if verbose {
         println!("\n  📤 Sending POST /session/init");
-        println!("     X-Nonce: {}", nonce);
-        println!("     X-Timestamp: {}", timestamp);
+        println!("     X-Idempotency-Key: {}", request_id);
         println!("     X-ClientId: {}", CLIENT_ID);
     }
 
@@ -369,8 +369,7 @@ async fn init_session(
     let response = client
         .post(format!("{}/session/init", SERVER_URL))
         .header("Content-Type", "application/json")
-        .header("X-Nonce", &nonce)
-        .header("X-Timestamp", &timestamp)
+        .header("X-Idempotency-Key", &request_id)
         .header("X-ClientId", CLIENT_ID)
         .json(&req_body)
         .send()
@@ -484,16 +483,15 @@ async fn make_purchase(
         println!("     {}", serde_json::to_string(&purchase_data)?);
     }
 
-    // Generate IV and nonce
-    let mut iv = [0u8; 12];
-    rng.fill(&mut iv).unwrap();
+    // Generate nonce and timestamp for replay protection
     let nonce_str = uuid::Uuid::new_v4().to_string();
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)?
         .as_millis()
         .to_string();
+    let request_id = format!("{}.{}", timestamp, nonce_str);
 
-    // Build AAD
+    // Build AAD (server will reconstruct from headers)
     // Format: TIMESTAMP|NONCE|KID|CLIENTID
     let aad = format!(
         "{}|{}|{}|{}",
@@ -503,7 +501,6 @@ async fn make_purchase(
 
     if verbose {
         println!("\n  🔒 Encrypting request...");
-        println!("     IV (base64): {}", BASE64.encode(&iv));
         println!(
             "     AAD: {}|{}...|session:{}...|{}",
             timestamp,
@@ -513,8 +510,11 @@ async fn make_purchase(
         );
     }
 
-    // Encrypt with AES-256-GCM
-    let (ciphertext, tag) = measure_sync("aes-gcm-encrypt", &mut crypto_ops, || {
+    // Encrypt with AES-256-GCM - returns IV || ciphertext || tag
+    let encrypted_body = measure_sync("aes-gcm-encrypt", &mut crypto_ops, || {
+        let mut iv = [0u8; 12];
+        rng.fill(&mut iv).unwrap();
+
         let unbound_key =
             aead::UnboundKey::new(&aead::AES_256_GCM, &session.session_key).unwrap();
         let nonce_seq = SingleNonce::new(iv);
@@ -524,12 +524,16 @@ async fn make_purchase(
         let aad = Aad::from(aad_bytes);
         let tag = sealing_key.seal_in_place_separate_tag(aad, &mut in_out).unwrap();
 
-        (in_out, tag.as_ref().to_vec())
+        // Concatenate IV || ciphertext || tag
+        let mut result = Vec::with_capacity(12 + in_out.len() + 16);
+        result.extend_from_slice(&iv);
+        result.extend_from_slice(&in_out);
+        result.extend_from_slice(tag.as_ref());
+        result
     });
 
     if verbose {
-        println!("     Ciphertext length: {} bytes", ciphertext.len());
-        println!("     Auth tag (base64): {}", BASE64.encode(&tag));
+        println!("     Encrypted body length: {} bytes (IV + ciphertext + tag)", encrypted_body.len());
         println!("\n  📤 Sending encrypted POST /transaction/purchase");
     }
 
@@ -538,14 +542,9 @@ async fn make_purchase(
         .post(format!("{}/transaction/purchase", SERVER_URL))
         .header("Content-Type", "application/octet-stream")
         .header("X-Kid", &session.kid)
-        .header("X-Enc-Alg", "A256GCM")
-        .header("X-IV", BASE64.encode(&iv))
-        .header("X-Tag", BASE64.encode(&tag))
-        .header("X-AAD", BASE64.encode(aad_bytes))
-        .header("X-Nonce", &nonce_str)
-        .header("X-Timestamp", &timestamp)
+        .header("X-Idempotency-Key", &request_id)
         .header("X-ClientId", &session.client_id)
-        .body(BASE64.encode(&ciphertext))
+        .body(encrypted_body)
         .send()
         .await?;
     let http_ms = http_start.elapsed().as_secs_f64() * 1000.0;
@@ -569,71 +568,60 @@ async fn make_purchase(
     }
 
     // Extract response headers
-    let resp_iv_b64 = response
-        .headers()
-        .get("X-IV")
-        .ok_or("Missing X-IV header")?
-        .to_str()?
-        .to_string();
-    let resp_tag_b64 = response
-        .headers()
-        .get("X-Tag")
-        .ok_or("Missing X-Tag header")?
-        .to_str()?
-        .to_string();
-    let resp_aad_b64 = response
-        .headers()
-        .get("X-AAD")
-        .ok_or("Missing X-AAD header")?
-        .to_str()?
-        .to_string();
     let resp_kid = response
         .headers()
         .get("X-Kid")
         .ok_or("Missing X-Kid header")?
         .to_str()?
         .to_string();
-    let resp_enc_alg = response
+    let resp_request_id = response
         .headers()
-        .get("X-Enc-Alg")
-        .ok_or("Missing X-Enc-Alg header")?
+        .get("X-Idempotency-Key")
+        .ok_or("Missing X-Idempotency-Key header")?
         .to_str()?
         .to_string();
 
     if verbose {
         println!("     Response headers:");
         println!("       X-Kid: {}", resp_kid);
-        println!("       X-Enc-Alg: {}", resp_enc_alg);
-        println!("       X-IV: {}...", &resp_iv_b64[..16]);
-        println!("       X-Tag: {}...", &resp_tag_b64[..20]);
+        println!("       X-Idempotency-Key: {}...", &resp_request_id[..30.min(resp_request_id.len())]);
     }
 
-    let body = response.text().await?;
+    // Get encrypted body (IV || ciphertext || tag)
+    let resp_encrypted_body = response.bytes().await?;
 
     if verbose {
+        println!("     Encrypted body length: {} bytes", resp_encrypted_body.len());
         println!("\n  🔓 Decrypting response...");
     }
 
-    // Decode response
-    let resp_iv = BASE64.decode(&resp_iv_b64)?;
-    let resp_tag = BASE64.decode(&resp_tag_b64)?;
-    let resp_aad = BASE64.decode(&resp_aad_b64)?;
-    let resp_ciphertext = BASE64.decode(&body)?;
+    // Parse response request ID to get timestamp and nonce for AAD reconstruction
+    let parts: Vec<&str> = resp_request_id.split('.').collect();
+    if parts.len() != 2 {
+        return Err("Invalid X-Idempotency-Key format in response".into());
+    }
+    let resp_timestamp = parts[0];
+    let resp_nonce = parts[1];
 
-    // Decrypt response
+    // Reconstruct AAD from response headers
+    let resp_aad = format!("{}|{}|{}|{}", resp_timestamp, resp_nonce, resp_kid, session.client_id);
+
+    // Decrypt response - body contains IV || ciphertext || tag
     let resp_plaintext = measure_sync("aes-gcm-decrypt", &mut crypto_ops, || {
+        // Extract IV (first 12 bytes)
+        let resp_iv = &resp_encrypted_body[..12];
+        // Rest is ciphertext || tag
+        let ciphertext_with_tag = &resp_encrypted_body[12..];
+
         let unbound_key =
             aead::UnboundKey::new(&aead::AES_256_GCM, &session.session_key).unwrap();
         let mut resp_iv_arr = [0u8; 12];
-        resp_iv_arr.copy_from_slice(&resp_iv);
+        resp_iv_arr.copy_from_slice(resp_iv);
         let nonce_seq = SingleNonce::new(resp_iv_arr);
         let mut opening_key = aead::OpeningKey::new(unbound_key, nonce_seq);
 
-        // Combine ciphertext and tag
-        let mut in_out = resp_ciphertext.clone();
-        in_out.extend_from_slice(&resp_tag);
-
-        let aad = Aad::from(resp_aad.as_slice());
+        let mut in_out = ciphertext_with_tag.to_vec();
+        let aad = Aad::from(resp_aad.as_bytes());
         let plaintext = opening_key.open_in_place(aad, &mut in_out).unwrap();
         plaintext.to_vec()
     });

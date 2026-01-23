@@ -21,29 +21,31 @@ export function hkdf32(
   return Buffer.from(crypto.hkdfSync("sha256", sharedSecret, salt, info, 32));
 }
 
-// AES-256-GCM encryption
+// AES-256-GCM encryption - returns IV || ciphertext || tag
 export function aesGcmEncrypt(
   key32: Buffer,
-  iv12: Buffer,
   aad: Buffer,
   plaintext: Buffer
-): { ciphertext: Buffer; tag: Buffer } {
-  const cipher = crypto.createCipheriv("aes-256-gcm", key32, iv12);
+): Buffer {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key32, iv);
   cipher.setAAD(aad);
   const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
   const tag = cipher.getAuthTag();
-  return { ciphertext, tag };
+  return Buffer.concat([iv, ciphertext, tag]); // IV (12) || ciphertext || tag (16)
 }
 
-// AES-256-GCM decryption
+// AES-256-GCM decryption - expects IV || ciphertext || tag
 export function aesGcmDecrypt(
   key32: Buffer,
-  iv12: Buffer,
   aad: Buffer,
-  ciphertext: Buffer,
-  tag: Buffer
+  data: Buffer
 ): Buffer {
-  const decipher = crypto.createDecipheriv("aes-256-gcm", key32, iv12);
+  const iv = data.subarray(0, 12);
+  const tag = data.subarray(-16);
+  const ciphertext = data.subarray(12, -16);
+
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key32, iv);
   decipher.setAAD(aad);
   decipher.setAuthTag(tag);
   return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
@@ -129,11 +131,6 @@ export async function validateReplayProtection(
   if (!wasSet) {
     throw new Error("REPLAY_DETECTED");
   }
-}
-
-// Generate random IV (12 bytes for AES-GCM)
-export function generateIv(): Buffer {
-  return crypto.randomBytes(12);
 }
 
 // Generate session ID with 128-bit entropy

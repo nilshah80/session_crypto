@@ -1,4 +1,5 @@
 use axum::{
+    body::Bytes,
     extract::State,
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
@@ -259,15 +260,15 @@ fn hkdf32(shared_secret: &[u8], salt_bytes: &[u8], info: &[u8]) -> Vec<u8> {
     okm
 }
 
-// AES-256-GCM encryption using RustCrypto
+// AES-256-GCM encryption - returns IV || ciphertext || tag
 fn aes_gcm_encrypt(
     key: &[u8],
-    iv: &[u8; 12],
     aad: &[u8],
     plaintext: &[u8],
-) -> Result<(Vec<u8>, Vec<u8>), aes_gcm::Error> {
+) -> Result<Vec<u8>, aes_gcm::Error> {
+    let iv = generate_iv();
     let cipher = Aes256Gcm::new_from_slice(key).expect("Invalid key length");
-    let nonce = Nonce::from_slice(iv);
+    let nonce = Nonce::from_slice(&iv);
 
     let payload = Payload {
         msg: plaintext,
@@ -276,31 +277,31 @@ fn aes_gcm_encrypt(
 
     let ciphertext_with_tag = cipher.encrypt(nonce, payload)?;
 
-    // Split ciphertext and tag (tag is last 16 bytes)
-    let tag_start = ciphertext_with_tag.len() - 16;
-    let ciphertext = ciphertext_with_tag[..tag_start].to_vec();
-    let tag = ciphertext_with_tag[tag_start..].to_vec();
-
-    Ok((ciphertext, tag))
+    // Return IV || ciphertext || tag (tag is already appended by aes_gcm)
+    let mut result = Vec::with_capacity(12 + ciphertext_with_tag.len());
+    result.extend_from_slice(&iv);
+    result.extend_from_slice(&ciphertext_with_tag);
+    Ok(result)
 }
 
-// AES-256-GCM decryption using RustCrypto
+// AES-256-GCM decryption - expects IV || ciphertext || tag
 fn aes_gcm_decrypt(
     key: &[u8],
-    iv: &[u8; 12],
     aad: &[u8],
-    ciphertext: &[u8],
-    tag: &[u8],
+    encrypted_body: &[u8],
 ) -> Result<Vec<u8>, aes_gcm::Error> {
+    if encrypted_body.len() < 12 + 16 {
+        return Err(aes_gcm::Error);
+    }
+
+    let iv = &encrypted_body[..12];
+    let ciphertext_with_tag = &encrypted_body[12..];
+
     let cipher = Aes256Gcm::new_from_slice(key).expect("Invalid key length");
     let nonce = Nonce::from_slice(iv);
 
-    // Combine ciphertext and tag
-    let mut ciphertext_with_tag = ciphertext.to_vec();
-    ciphertext_with_tag.extend_from_slice(tag);
-
     let payload = Payload {
-        msg: &ciphertext_with_tag,
+        msg: ciphertext_with_tag,
         aad,
     };
 
@@ -405,13 +406,20 @@ async fn session_init_handler(
 ) -> impl IntoResponse {
     let mut metrics = MetricsCollector::new();
 
-    let nonce = headers.get("x-nonce").and_then(|v| v.to_str().ok()).unwrap_or("");
-    let timestamp = headers.get("x-timestamp").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let idempotency_key = headers.get("x-idempotency-key").and_then(|v| v.to_str().ok()).unwrap_or("");
     let client_id = headers.get("x-clientid").and_then(|v| v.to_str().ok()).unwrap_or("");
 
-    if nonce.is_empty() || timestamp.is_empty() || client_id.is_empty() {
+    if idempotency_key.is_empty() || client_id.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "CRYPTO_ERROR", &metrics);
     }
+
+    // Parse X-Idempotency-Key: timestamp.nonce
+    let parts: Vec<&str> = idempotency_key.split('.').collect();
+    if parts.len() != 2 {
+        return error_response(StatusCode::BAD_REQUEST, "CRYPTO_ERROR", &metrics);
+    }
+    let timestamp = parts[0];
+    let nonce = parts[1];
 
     // Replay protection
     {
@@ -499,28 +507,25 @@ async fn session_init_handler(
 async fn transaction_purchase_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    body: String,
+    body: Bytes,
 ) -> impl IntoResponse {
     let mut metrics = MetricsCollector::new();
 
     let kid = headers.get("x-kid").and_then(|v| v.to_str().ok()).unwrap_or("");
-    let enc_alg = headers.get("x-enc-alg").and_then(|v| v.to_str().ok()).unwrap_or("");
-    let iv_b64 = headers.get("x-iv").and_then(|v| v.to_str().ok()).unwrap_or("");
-    let tag_b64 = headers.get("x-tag").and_then(|v| v.to_str().ok()).unwrap_or("");
-    let aad_b64 = headers.get("x-aad").and_then(|v| v.to_str().ok()).unwrap_or("");
-    let nonce = headers.get("x-nonce").and_then(|v| v.to_str().ok()).unwrap_or("");
-    let timestamp = headers.get("x-timestamp").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let idempotency_key = headers.get("x-idempotency-key").and_then(|v| v.to_str().ok()).unwrap_or("");
     let client_id = headers.get("x-clientid").and_then(|v| v.to_str().ok()).unwrap_or("");
 
-    if kid.is_empty() || enc_alg.is_empty() || iv_b64.is_empty() || tag_b64.is_empty()
-        || aad_b64.is_empty() || nonce.is_empty() || timestamp.is_empty() || client_id.is_empty()
-    {
+    if kid.is_empty() || idempotency_key.is_empty() || client_id.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "CRYPTO_ERROR", &metrics);
     }
 
-    if enc_alg != "A256GCM" {
+    // Parse X-Idempotency-Key: timestamp.nonce
+    let parts: Vec<&str> = idempotency_key.split('.').collect();
+    if parts.len() != 2 {
         return error_response(StatusCode::BAD_REQUEST, "CRYPTO_ERROR", &metrics);
     }
+    let timestamp = parts[0];
+    let nonce = parts[1];
 
     // Replay protection
     {
@@ -555,41 +560,17 @@ async fn transaction_purchase_handler(
         None => return error_response(StatusCode::UNAUTHORIZED, "SESSION_EXPIRED", &metrics),
     };
 
-    let iv = match b64_decode(iv_b64) {
-        Ok(v) if v.len() == 12 => v,
-        _ => return error_response(StatusCode::BAD_REQUEST, "CRYPTO_ERROR", &metrics),
-    };
-
-    let tag = match b64_decode(tag_b64) {
-        Ok(v) if v.len() == 16 => v,
-        _ => return error_response(StatusCode::BAD_REQUEST, "CRYPTO_ERROR", &metrics),
-    };
-
-    let aad = match b64_decode(aad_b64) {
-        Ok(v) => v,
-        Err(_) => return error_response(StatusCode::BAD_REQUEST, "CRYPTO_ERROR", &metrics),
-    };
-
-    let ciphertext = match b64_decode(&body) {
-        Ok(v) => v,
-        Err(_) => return error_response(StatusCode::BAD_REQUEST, "CRYPTO_ERROR", &metrics),
-    };
-
-    let expected_aad = metrics.measure("aad-validation", || build_aad(timestamp, nonce, kid, client_id));
-
-    if aad != expected_aad {
-        warn!("AAD mismatch");
-        return error_response(StatusCode::BAD_REQUEST, "CRYPTO_ERROR", &metrics);
-    }
-
     let session_key = match b64_decode(&session.key) {
         Ok(v) => v,
         Err(_) => return error_response(StatusCode::BAD_REQUEST, "CRYPTO_ERROR", &metrics),
     };
 
-    let iv_array: [u8; 12] = iv.try_into().unwrap();
+    // Build AAD from headers
+    let aad = metrics.measure("aad-build", || build_aad(timestamp, nonce, kid, client_id));
+
+    // Decrypt request body (IV || ciphertext || tag)
     let plaintext = match metrics.measure("aes-gcm-decrypt", || {
-        aes_gcm_decrypt(&session_key, &iv_array, &aad, &ciphertext, &tag)
+        aes_gcm_decrypt(&session_key, &aad, &body)
     }) {
         Ok(p) => p,
         Err(_) => {
@@ -621,28 +602,24 @@ async fn transaction_purchase_handler(
     };
 
     let response_plaintext = serde_json::to_vec(&response_data).unwrap();
-    let response_iv = generate_iv();
     let response_nonce = uuid::Uuid::new_v4().to_string();
     let response_timestamp = current_timestamp_ms().to_string();
+    let response_idempotency_key = format!("{}.{}", response_timestamp, response_nonce);
 
     let response_aad = build_aad(&response_timestamp, &response_nonce, kid, client_id);
 
-    let (response_ciphertext, response_tag) = metrics.measure("aes-gcm-encrypt", || {
-        aes_gcm_encrypt(&session_key, &response_iv, &response_aad, &response_plaintext).unwrap()
+    // Encrypt - returns IV || ciphertext || tag
+    let encrypted_response = metrics.measure("aes-gcm-encrypt", || {
+        aes_gcm_encrypt(&session_key, &response_aad, &response_plaintext).unwrap()
     });
 
     let mut response_headers = HeaderMap::new();
     response_headers.insert("X-Kid", HeaderValue::from_str(kid).unwrap());
-    response_headers.insert("X-Enc-Alg", HeaderValue::from_static("A256GCM"));
-    response_headers.insert("X-IV", HeaderValue::from_str(&b64_encode(&response_iv)).unwrap());
-    response_headers.insert("X-Tag", HeaderValue::from_str(&b64_encode(&response_tag)).unwrap());
-    response_headers.insert("X-AAD", HeaderValue::from_str(&b64_encode(&response_aad)).unwrap());
-    response_headers.insert("X-Nonce", HeaderValue::from_str(&response_nonce).unwrap());
-    response_headers.insert("X-Timestamp", HeaderValue::from_str(&response_timestamp).unwrap());
+    response_headers.insert("X-Idempotency-Key", HeaderValue::from_str(&response_idempotency_key).unwrap());
     response_headers.insert("Content-Type", HeaderValue::from_static("application/octet-stream"));
     response_headers.insert("Server-Timing", HeaderValue::from_str(&metrics.to_server_timing_header()).unwrap());
 
-    (StatusCode::OK, response_headers, b64_encode(&response_ciphertext)).into_response()
+    (StatusCode::OK, response_headers, encrypted_response).into_response()
 }
 
 async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -717,22 +694,14 @@ async fn main() {
         .allow_methods(Any)
         .allow_headers([
             "content-type".parse().unwrap(),
-            "x-nonce".parse().unwrap(),
-            "x-timestamp".parse().unwrap(),
+            "x-idempotency-key".parse().unwrap(),
             "x-clientid".parse().unwrap(),
             "x-kid".parse().unwrap(),
-            "x-enc-alg".parse().unwrap(),
-            "x-iv".parse().unwrap(),
-            "x-tag".parse().unwrap(),
-            "x-aad".parse().unwrap(),
         ])
         .expose_headers([
             "server-timing".parse().unwrap(),
             "x-kid".parse().unwrap(),
-            "x-enc-alg".parse().unwrap(),
-            "x-iv".parse().unwrap(),
-            "x-tag".parse().unwrap(),
-            "x-aad".parse().unwrap(),
+            "x-idempotency-key".parse().unwrap(),
         ]);
 
     let app = Router::new()
