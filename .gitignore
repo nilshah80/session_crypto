@@ -68,3 +68,4 @@ client/go/go-client
 client/go/client
 server-go/server
 *.exe
+nul

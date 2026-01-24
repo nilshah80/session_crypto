@@ -6,17 +6,21 @@ A proof-of-concept implementation of the session-based encryption design using E
 
 ```
 ┌─────────────────┐         ┌─────────────────┐         ┌─────────────────┐
-│     Client      │         │     Server      │         │     Redis       │
-│  (Multi-lang)   │         │  (Multi-lang)   │         │   (Sessions)    │
+│     Client      │         │     Server      │         │   PostgreSQL    │
+│  (Multi-lang)   │         │  (Multi-lang)   │         │  (Persistence)  │
 └────────┬────────┘         └────────┬────────┘         └────────┬────────┘
          │                           │                           │
+         │                           │                   ┌───────┴───────┐
+         │                           │                   │     Redis     │
+         │                           │                   │    (Cache)    │
+         │                           │                   └───────┬───────┘
          │  POST /session/init       │                           │
          │  + clientPublicKey        │                           │
          ├──────────────────────────►│                           │
          │                           │  Generate serverKeypair   │
          │                           │  sharedSecret = ECDH      │
          │                           │  sessionKey = HKDF        │
-         │                           │  Store session ──────────►│
+         │                           │  Store session ──────────►│ (PostgreSQL + Redis)
          │  sessionId                │                           │
          │  + serverPublicKey        │                           │
          │◄──────────────────────────┤                           │
@@ -26,8 +30,8 @@ A proof-of-concept implementation of the session-based encryption design using E
          │  POST /transaction/purchase                           │
          │  [encrypted with sessionKey]                          │
          ├──────────────────────────►│                           │
-         │                           │  Lookup session ◄─────────│
-         │                           │  Verify nonce ◄───────────│
+         │                           │  Lookup session ◄─────────│ (Redis → PostgreSQL)
+         │                           │  Verify nonce ◄───────────│ (Redis)
          │                           │  Decrypt & process        │
          │  [encrypted response]     │                           │
          │◄──────────────────────────┤                           │
@@ -38,14 +42,14 @@ A proof-of-concept implementation of the session-based encryption design using E
 
 ## Prerequisites
 
-- **Server** (any one): Node.js 20+, Go 1.25+, or Rust 1.92+
-- **Infrastructure**: Docker (for Redis)
+- **Server** (any one): Node.js 24+, Go 1.25+, Rust 1.93+, or .NET 10.0
+- **Infrastructure**: Docker (for Redis and PostgreSQL)
 - **Clients** (any one):
-  - Node.js 20+
+  - Node.js 24+
   - .NET 10.0
   - Java 25
   - Go 1.25+
-  - Rust 1.92+
+  - Rust 1.93+
 
 ## Quick Start
 
@@ -67,13 +71,23 @@ npm run dev
 
 # Go (Chi router)
 cd server-go
-go build -o server-go .
-./server-go
+go run .
 
-# Rust (Axum)
+# Rust with aws-lc-rs (fastest)
 cd server-rust
-cargo build --release
-./target/release/session-crypto-server
+cargo run --release
+
+# Rust with ring crypto
+cd server-rust-ring
+cargo run --release
+
+# Rust with native RustCrypto
+cd server-rust-native
+cargo run --release
+
+# .NET 10 (ASP.NET Core)
+cd server-dotnet
+dotnet run
 ```
 
 All servers start on `http://localhost:3000`
@@ -127,12 +141,12 @@ npm start
 
 | Language | Directory | Version | Pattern |
 |----------|-----------|---------|---------|
-| Node.js | `client/node/` | Node 20+ | Async/await |
+| Node.js | `client/node/` | Node 24+ | Async/await |
 | .NET C# | `client/dotnet/` | .NET 10.0 | Async/await |
 | Java | `client/java-virtual-threads/` | Java 25 | Virtual Threads |
 | Java | `client/java-webflux/` | Java 25 | CompletableFuture |
-| Go | `client/go/` | Go 1.25 | Goroutines |
-| Rust | `client/rust/` | Rust 1.92 | Tokio async |
+| Go | `client/go/` | Go 1.25+ | Goroutines |
+| Rust | `client/rust/` | Rust 1.93+ | Tokio async |
 
 ### Browser SPA Clients
 
@@ -145,13 +159,16 @@ All clients implement the same encryption flow and produce identical outputs.
 
 ## Server Implementations
 
-| Language | Directory | Framework | Pattern |
-|----------|-----------|-----------|---------|
-| Node.js | `server/` | Fastify | Async/await |
-| Go | `server-go/` | Chi | Goroutines |
-| Rust | `server-rust/` | Axum | Tokio async |
+| Language | Directory | Framework | Crypto Library |
+|----------|-----------|-----------|----------------|
+| Node.js | `server/` | Fastify | Node.js crypto |
+| Go | `server-go/` | Chi | crypto/ecdh |
+| Rust | `server-rust/` | Axum | aws-lc-rs |
+| Rust | `server-rust-ring/` | Axum | ring |
+| Rust | `server-rust-native/` | Axum | RustCrypto (p256, aes-gcm) |
+| .NET | `server-dotnet/` | ASP.NET Core | System.Security.Cryptography |
 
-All servers implement identical endpoints and crypto operations.
+All servers implement identical endpoints and crypto operations with PostgreSQL for persistence and Redis for caching.
 
 ## Endpoints
 
@@ -208,7 +225,8 @@ Health check endpoint.
 {
   "status": "ok",
   "timestamp": "2026-01-18T12:00:00.000Z",
-  "redis": "ok"
+  "redis": "ok",
+  "postgres": "ok"
 }
 ```
 
@@ -233,39 +251,61 @@ Health check endpoint.
 - Generic error responses (prevents oracle attacks)
 - Session TTL enforcement
 
-## Redis Schema
+## Data Storage
+
+### PostgreSQL (Source of Truth)
+
+```sql
+CREATE TABLE sessions (
+    session_id VARCHAR(255) PRIMARY KEY,
+    data JSONB NOT NULL,          -- {key, type, expiresAt}
+    expires_at BIGINT NOT NULL
+);
+CREATE INDEX idx_sessions_expires_at ON sessions(expires_at);
+```
+
+### Redis (Cache + Nonce Store)
 
 ```
-sess:<sessionId>   → {key, type, expiresAt, principal}   TTL: 1800s (auth) / 120s (anon)
-nonce:<uuid>       → "1"                                  TTL: 300s
+sess:<sessionId>   → {key, type, expiresAt}   TTL: matches session TTL
+nonce:<uuid>       → "1"                       TTL: 300s (replay protection)
 ```
 
 ## Project Structure
 
 ```
 session_crypto/
-├── docker-compose.yml          # Redis 8 container
+├── docker-compose.yml          # Redis + PostgreSQL containers
 ├── server/                     # Node.js server (Fastify)
 │   ├── src/
 │   │   ├── index.ts            # Server with endpoints
 │   │   ├── crypto-helpers.ts   # ECDH, HKDF, AES-GCM, replay protection
-│   │   ├── session-store.ts    # Redis session storage
+│   │   ├── session-store.ts    # PostgreSQL + Redis session storage
 │   │   └── metrics.ts          # Server-Timing header support
 │   ├── package.json
 │   └── tsconfig.json
 ├── server-go/                  # Go server (Chi)
 │   ├── main.go                 # All-in-one server implementation
 │   └── go.mod
-├── server-rust/                # Rust server (Axum)
-│   ├── src/main.rs             # All-in-one server implementation
+├── server-rust/                # Rust server (Axum + aws-lc-rs)
+│   ├── src/main.rs
 │   └── Cargo.toml
+├── server-rust-ring/           # Rust server (Axum + ring)
+│   ├── src/main.rs
+│   └── Cargo.toml
+├── server-rust-native/         # Rust server (Axum + RustCrypto)
+│   ├── src/main.rs
+│   └── Cargo.toml
+├── server-dotnet/              # .NET 10 server (ASP.NET Core)
+│   ├── Program.cs
+│   └── SessionCryptoServer.csproj
 ├── client/
-│   ├── node/                   # Node.js reference client
+│   ├── node/                   # Node.js client
 │   ├── dotnet/                 # .NET 10 client
 │   ├── java-virtual-threads/   # Java 25 with Virtual Threads
 │   ├── java-webflux/           # Java 25 with CompletableFuture
-│   ├── go/                     # Go 1.25 client
-│   ├── rust/                   # Rust 1.92 client
+│   ├── go/                     # Go client
+│   ├── rust/                   # Rust client
 │   ├── angular-spa/            # Angular 19 browser client
 │   └── react-spa/              # React 19 browser client
 └── README.md
@@ -334,60 +374,50 @@ dotnet run -- --benchmark 1000
 
 ### Benchmark Results
 
-All benchmarks run on Apple M4 Max with local Redis. Results at 1000 iterations (after 5 warmup).
+Results at 1000 iterations (after 5 warmup) with local Redis and PostgreSQL.
 
-#### Server Comparison (Combined Flow Throughput in req/s)
+#### .NET Server Benchmark (Combined Flow)
 
-| Client \ Server | Node.js | Go | Rust |
-|-----------------|---------|-----|------|
-| **Go** | 751.1 | **934.7** | 982.9 |
-| **Rust** | 369.7 | 922.7 | **926.3** |
-| **Node.js** | 337.3 | 614.1 | **480.5** |
+| Client | Throughput | Mean Latency | P50 | P95 | P99 |
+|--------|------------|--------------|-----|-----|-----|
+| **Rust** | **141.2 req/s** | 7.1ms | 6.8ms | 8.9ms | 11.4ms |
+| **Node.js** | 125.7 req/s | 8.0ms | 7.8ms | 9.4ms | 11.2ms |
+| **.NET** | 107.9 req/s | 9.3ms | 8.9ms | 10.8ms | 17.8ms |
+| **Go** | 104.0 req/s | 9.6ms | 9.5ms | 12.6ms | 16.9ms |
 
-**Key Findings:**
-- Go client + Rust server is fastest (~983 req/s)
-- Go and Rust servers significantly outperform Node.js server
-- Native clients (Go, Rust) are 2-3x faster than Node.js client
+#### .NET Server - Endpoint Breakdown
 
-#### Detailed Results by Server
+**Session Init (`/session/init`):**
 
-**Node.js Server (Fastify):**
+| Client | Throughput | Mean Latency | P99 |
+|--------|------------|--------------|-----|
+| **Rust** | 165.0 req/s | 6.1ms | 9.9ms |
+| **Node.js** | 154.5 req/s | 6.5ms | 9.4ms |
+| **Go** | 137.8 req/s | 7.3ms | 14.3ms |
+| **.NET** | 123.4 req/s | 8.1ms | 16.4ms |
 
-| Client | /session/init | /transaction/purchase | Combined |
-|--------|---------------|----------------------|----------|
-| Go | 1323.5 req/s | 1739.4 req/s | 751.1 req/s |
-| Rust | 671.1 req/s | 823.8 req/s | 369.7 req/s |
-| Node.js | 613.8 req/s | 749.8 req/s | 337.3 req/s |
+**Transaction (`/transaction/purchase`):**
 
-**Go Server (Chi):**
-
-| Client | /session/init | /transaction/purchase | Combined |
-|--------|---------------|----------------------|----------|
-| Go | 1729.6 req/s | 2036.9 req/s | **934.7 req/s** |
-| Rust | 1717.8 req/s | 1996.0 req/s | 922.7 req/s |
-| Node.js | 1143.2 req/s | 1329.2 req/s | 614.1 req/s |
-
-**Rust Server (Axum):**
-
-| Client | /session/init | /transaction/purchase | Combined |
-|--------|---------------|----------------------|----------|
-| Go | 1829.4 req/s | 2128.0 req/s | **982.9 req/s** |
-| Rust | 1728.6 req/s | 1998.3 req/s | 926.3 req/s |
-| Node.js | 904.5 req/s | 1026.7 req/s | 480.5 req/s |
+| Client | Throughput | Mean Latency | P99 |
+|--------|------------|--------------|-----|
+| **Rust** | 982.1 req/s | 1.0ms | 1.7ms |
+| **.NET** | 920.0 req/s | 1.1ms | 2.4ms |
+| **Node.js** | 677.7 req/s | 1.5ms | 2.7ms |
+| **Go** | 426.2 req/s | 2.3ms | 4.3ms |
 
 #### Client Performance Ranking
 
 | Rank | Client | Best Throughput | Notes |
 |------|--------|-----------------|-------|
-| 1 | Go | 982.9 req/s | Fastest with Rust server |
-| 2 | Rust | 926.3 req/s | Uses aws-lc-rs (AWS LibCrypto) |
-| 3 | Node.js | 614.1 req/s | Best with Go server |
+| 1 | Rust | 141.2 req/s | Uses aws-lc-rs (AWS LibCrypto) |
+| 2 | Node.js | 125.7 req/s | tsx runtime |
+| 3 | .NET | 107.9 req/s | System.Security.Cryptography |
+| 4 | Go | 104.0 req/s | crypto/ecdh |
 
 **Notes:**
-- Go and Rust clients show nearly identical performance (~920-980 req/s)
-- Go server excels with native clients due to efficient goroutines
-- Rust server provides highest throughput overall
-- All implementations stay under 2ms P50 latency
+- Rust client achieves ~982 req/s on transaction endpoint
+- Session init is slower due to ECDH key generation and database writes
+- All clients maintain sub-18ms P99 latency
 
 #### Why Java Clients Are Slower
 
@@ -411,7 +441,7 @@ This is a known limitation of JCA. For better Java crypto performance, consider:
 ### Stop Services
 
 ```bash
-# Stop Redis
+# Stop Redis and PostgreSQL
 docker compose down
 
 # Stop server
@@ -432,4 +462,17 @@ GET sess:S-<sessionId>
 
 # Check TTL
 TTL sess:S-<sessionId>
+```
+
+### View PostgreSQL Data
+
+```bash
+# Connect to PostgreSQL
+docker exec -it session-crypto-postgres psql -U postgres -d session_crypto
+
+# List sessions
+SELECT session_id, expires_at FROM sessions;
+
+# View session data
+SELECT * FROM sessions WHERE session_id = 'S-<sessionId>';
 ```

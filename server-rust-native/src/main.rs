@@ -283,14 +283,14 @@ fn aes_gcm_encrypt(
 ) -> Result<Vec<u8>, aes_gcm::Error> {
     let iv = generate_iv();
     let cipher = Aes256Gcm::new_from_slice(key).expect("Invalid key length");
-    let nonce = Nonce::from_slice(&iv);
+    let nonce = Nonce::from(iv);
 
     let payload = Payload {
         msg: plaintext,
         aad,
     };
 
-    let ciphertext_with_tag = cipher.encrypt(nonce, payload)?;
+    let ciphertext_with_tag = cipher.encrypt(&nonce, payload)?;
 
     // Return IV || ciphertext || tag (tag is already appended by aes_gcm)
     let mut result = Vec::with_capacity(12 + ciphertext_with_tag.len());
@@ -309,18 +309,18 @@ fn aes_gcm_decrypt(
         return Err(aes_gcm::Error);
     }
 
-    let iv = &encrypted_body[..12];
+    let iv: [u8; 12] = encrypted_body[..12].try_into().map_err(|_| aes_gcm::Error)?;
     let ciphertext_with_tag = &encrypted_body[12..];
 
     let cipher = Aes256Gcm::new_from_slice(key).expect("Invalid key length");
-    let nonce = Nonce::from_slice(iv);
+    let nonce = Nonce::from(iv);
 
     let payload = Payload {
         msg: ciphertext_with_tag,
         aad,
     };
 
-    cipher.decrypt(nonce, payload)
+    cipher.decrypt(&nonce, payload)
 }
 
 // Build AAD from request components
@@ -561,7 +561,7 @@ async fn session_init_handler(
     let salt = session_id.as_bytes();
     let info = format!("SESSION|A256GCM|{}", client_id);
     let session_key = metrics.measure("hkdf", || {
-        hkdf32(shared_secret.raw_secret_bytes().as_slice(), salt, info.as_bytes())
+        hkdf32(shared_secret.raw_secret_bytes().as_ref(), salt, info.as_bytes())
     });
 
     // Store session in PostgreSQL and Redis
