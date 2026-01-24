@@ -2,7 +2,7 @@
 name = "session-crypto-client"
 version = "1.0.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.93"
 
 [dependencies]
 tokio = { version = "1.43", features = ["full"] }
