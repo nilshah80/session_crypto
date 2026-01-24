@@ -15,7 +15,7 @@ import {
   buildAad,
   generateSessionId,
 } from "./crypto-helpers.js";
-import { storeSession, getSession, initSessionStore } from "./session-store.js";
+import { storeSession, getSession, initSessionStore, getPool, closeSessionStore } from "./session-store.js";
 import { MetricsCollector } from "./metrics.js";
 
 // Declare module augmentation for Fastify request
@@ -328,10 +328,26 @@ fastify.post("/transaction/purchase", async (request, reply) => {
 fastify.get("/health", async () => {
   // Check Redis connection
   const redisStatus = redis.status === "ready" ? "ok" : "disconnected";
+
+  // Check Postgres connection
+  let postgresStatus = "disconnected";
+  const pool = getPool();
+  if (pool) {
+    try {
+      await pool.query("SELECT 1");
+      postgresStatus = "ok";
+    } catch {
+      postgresStatus = "disconnected";
+    }
+  }
+
+  const status = redisStatus === "ok" && postgresStatus === "ok" ? "ok" : "degraded";
+
   return {
-    status: redisStatus === "ok" ? "ok" : "degraded",
+    status,
     timestamp: new Date().toISOString(),
     redis: redisStatus,
+    postgres: postgresStatus,
   };
 });
 
@@ -339,6 +355,7 @@ fastify.get("/health", async () => {
 const shutdown = async () => {
   console.log("Shutting down...");
   await redis.quit();
+  await closeSessionStore();
   await fastify.close();
   process.exit(0);
 };

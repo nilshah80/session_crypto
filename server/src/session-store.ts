@@ -1,7 +1,5 @@
 import { Redis } from "ioredis";
 import pg from "pg";
-import fs from "fs/promises";
-import path from "path";
 import { b64, unb64 } from "./crypto-helpers.js";
 
 const { Pool } = pg;
@@ -17,24 +15,51 @@ export interface SessionData {
 // Redis key prefix for sessions
 const SESSION_PREFIX = "sess:";
 
+// Embedded migration SQL (no file dependency)
+const MIGRATION_SQL = `
+  CREATE TABLE IF NOT EXISTS sessions (
+    session_id VARCHAR(255) PRIMARY KEY,
+    data JSONB NOT NULL,
+    expires_at BIGINT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
+`;
+
 let redis: Redis | null = null;
 let pool: pg.Pool | null = null;
 
 export async function initSessionStore(redisClient: Redis): Promise<void> {
   redis = redisClient;
+
+  // Pool configuration for production
   pool = new Pool({
     user: process.env.POSTGRES_USER || "postgres",
     password: process.env.POSTGRES_PASSWORD || "postgres",
     host: process.env.POSTGRES_HOST || "localhost",
     database: process.env.POSTGRES_DB || "session_crypto",
     port: parseInt(process.env.POSTGRES_PORT || "5432"),
+    // Connection pool settings
+    max: 25,                      // Maximum connections
+    idleTimeoutMillis: 60000,     // Close idle connections after 1 minute
+    connectionTimeoutMillis: 5000, // Fail fast if can't connect in 5 seconds
+    // SSL configuration (set POSTGRES_SSL=true in production)
+    ssl: process.env.POSTGRES_SSL === "true" ? { rejectUnauthorized: false } : undefined,
   });
 
-  const migrationPath = path.join(process.cwd(), "migrations", "scripts", "001_create_sessions_table.sql");
-  const migrationSql = await fs.readFile(migrationPath, "utf-8");
+  // Ensure table exists using embedded SQL
+  await pool.query(MIGRATION_SQL);
+}
 
-  // Ensure table exists
-  await pool.query(migrationSql);
+// Export pool for health checks and graceful shutdown
+export function getPool(): pg.Pool | null {
+  return pool;
+}
+
+export async function closeSessionStore(): Promise<void> {
+  if (pool) {
+    await pool.end();
+    pool = null;
+  }
 }
 
 export async function storeSession(
@@ -61,9 +86,9 @@ export async function storeSession(
 
   // 1. Write to PostgreSQL (Source of Truth)
   await pool.query(
-    `INSERT INTO sessions (session_id, data, expires_at) 
-     VALUES ($1, $2, $3) 
-     ON CONFLICT (session_id) DO UPDATE 
+    `INSERT INTO sessions (session_id, data, expires_at)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (session_id) DO UPDATE
      SET data = $2, expires_at = $3`,
     [sessionId, value, expiresAt]
   );
@@ -93,7 +118,9 @@ export async function getSession(sessionId: string): Promise<SessionData | null>
     return null;
   }
 
-  const dbValue = JSON.stringify(res.rows[0].data);
+  // Handle JSONB: pg returns parsed object, not string
+  const rawData = res.rows[0].data;
+  const dbValue = typeof rawData === "string" ? rawData : JSON.stringify(rawData);
   const parsed = await parseSession(dbValue, sessionId);
 
   // Populate Redis if found and valid
@@ -127,9 +154,10 @@ async function parseSession(jsonStr: string, sessionId: string): Promise<Session
 
     // Check if expired
     if (Date.now() > parsed.expiresAt) {
-      // Async cleanup
-      if (redis) redis.del(`${SESSION_PREFIX}${sessionId}`);
-      if (pool) pool.query("DELETE FROM sessions WHERE session_id = $1", [sessionId]);
+      // Async cleanup with proper await and error handling
+      cleanupExpiredSession(sessionId).catch((err) => {
+        console.error(`Failed to cleanup expired session ${sessionId}:`, err);
+      });
       return null;
     }
 
@@ -143,4 +171,17 @@ async function parseSession(jsonStr: string, sessionId: string): Promise<Session
   } catch {
     return null;
   }
+}
+
+async function cleanupExpiredSession(sessionId: string): Promise<void> {
+  const promises: Promise<unknown>[] = [];
+
+  if (redis) {
+    promises.push(redis.del(`${SESSION_PREFIX}${sessionId}`));
+  }
+  if (pool) {
+    promises.push(pool.query("DELETE FROM sessions WHERE session_id = $1", [sessionId]));
+  }
+
+  await Promise.all(promises);
 }

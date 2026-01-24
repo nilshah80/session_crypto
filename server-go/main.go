@@ -25,13 +25,15 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/crypto/hkdf"
 )
 
-// Redis client
+// Redis client and DB pool
 var rdb *redis.Client
-var ctx = context.Background()
+var dbPool *pgxpool.Pool
 
 // Constants
 const (
@@ -59,9 +61,10 @@ type ErrorResponse struct {
 }
 
 type HealthResponse struct {
-	Status    string `json:"status"`
+	Status   string `json:"status"`
 	Timestamp string `json:"timestamp"`
-	Redis     string `json:"redis"`
+	Redis    string `json:"redis"`
+	Postgres string `json:"postgres"`
 }
 
 type SessionData struct {
@@ -241,7 +244,7 @@ func validateP256PublicKey(publicKeyBytes []byte) error {
 }
 
 // Replay protection
-func validateReplayProtection(nonce, timestamp string) error {
+func validateReplayProtection(reqCtx context.Context, nonce, timestamp string) error {
 	ts, err := strconv.ParseInt(timestamp, 10, 64)
 	if err != nil {
 		return fmt.Errorf("TIMESTAMP_INVALID")
@@ -254,7 +257,7 @@ func validateReplayProtection(nonce, timestamp string) error {
 
 	// Nonce uniqueness check with Redis SET NX EX
 	key := noncePrefix + nonce
-	wasSet, err := rdb.SetNX(ctx, key, "1", time.Duration(nonceTTLSec)*time.Second).Result()
+	wasSet, err := rdb.SetNX(reqCtx, key, "1", time.Duration(nonceTTLSec)*time.Second).Result()
 	if err != nil {
 		return fmt.Errorf("REDIS_ERROR: %v", err)
 	}
@@ -267,7 +270,7 @@ func validateReplayProtection(nonce, timestamp string) error {
 }
 
 // Session store operations
-func storeSession(sessionID string, key []byte, sessionType string, ttlSec int) error {
+func storeSession(reqCtx context.Context, sessionID string, key []byte, sessionType string, ttlSec int) error {
 	expiresAt := time.Now().UnixMilli() + int64(ttlSec)*1000
 	data := SessionData{
 		Key:       b64Encode(key),
@@ -280,12 +283,46 @@ func storeSession(sessionID string, key []byte, sessionType string, ttlSec int) 
 		return err
 	}
 
-	return rdb.Set(ctx, sessionPrefix+sessionID, jsonData, time.Duration(ttlSec)*time.Second).Err()
+	// 1. Write to PostgreSQL (Source of Truth)
+	_, err = dbPool.Exec(reqCtx, `
+		INSERT INTO sessions (session_id, data, expires_at)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (session_id) DO UPDATE
+		SET data = EXCLUDED.data, expires_at = EXCLUDED.expires_at
+	`, sessionID, jsonData, expiresAt)
+	if err != nil {
+		return err
+	}
+
+	// 2. Write to Redis (Cache)
+	return rdb.Set(reqCtx, sessionPrefix+sessionID, jsonData, time.Duration(ttlSec)*time.Second).Err()
 }
 
-func getSession(sessionID string) (*SessionData, error) {
-	value, err := rdb.Get(ctx, sessionPrefix+sessionID).Result()
-	if err == redis.Nil {
+func getSession(reqCtx context.Context, sessionID string) (*SessionData, error) {
+	// 1. Try Redis
+	value, err := rdb.Get(reqCtx, sessionPrefix+sessionID).Result()
+	if err == nil {
+		var data SessionData
+		if err := json.Unmarshal([]byte(value), &data); err != nil {
+			return nil, err
+		}
+		// Check expiry
+		if time.Now().UnixMilli() > data.ExpiresAt {
+			go deleteSession(sessionID) // Async cleanup (uses background context)
+			return nil, nil
+		}
+		return &data, nil
+	}
+
+	if err != redis.Nil {
+		// Log Redis error but continue to DB
+		log.Printf("Warning: Redis error in getSession: %v", err)
+	}
+
+	// 2. Fallback to PostgreSQL
+	var dataJSON []byte
+	err = dbPool.QueryRow(reqCtx, "SELECT data FROM sessions WHERE session_id = $1", sessionID).Scan(&dataJSON)
+	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
@@ -293,17 +330,30 @@ func getSession(sessionID string) (*SessionData, error) {
 	}
 
 	var data SessionData
-	if err := json.Unmarshal([]byte(value), &data); err != nil {
+	if err := json.Unmarshal(dataJSON, &data); err != nil {
 		return nil, err
 	}
 
-	// Double-check expiry
+	// Check expiry
 	if time.Now().UnixMilli() > data.ExpiresAt {
-		rdb.Del(ctx, sessionPrefix+sessionID)
+		go deleteSession(sessionID) // Async cleanup (uses background context)
 		return nil, nil
 	}
 
+	// Populate Redis
+	ttl := time.Duration(data.ExpiresAt-time.Now().UnixMilli()) * time.Millisecond
+	if ttl > 0 {
+		rdb.Set(reqCtx, sessionPrefix+sessionID, dataJSON, ttl)
+	}
+
 	return &data, nil
+}
+
+// deleteSession uses background context since it may be called asynchronously
+func deleteSession(sessionID string) {
+	bgCtx := context.Background()
+	rdb.Del(bgCtx, sessionPrefix+sessionID)
+	dbPool.Exec(bgCtx, "DELETE FROM sessions WHERE session_id = $1", sessionID)
 }
 
 // HTTP Handlers
@@ -331,9 +381,10 @@ func sessionInitHandler(w http.ResponseWriter, r *http.Request) {
 	nonce := parts[1]
 
 	// Replay protection
+	reqCtx := r.Context()
 	var replayErr error
 	metrics.MeasureResult("replay-protection", func() error {
-		replayErr = validateReplayProtection(nonce, timestamp)
+		replayErr = validateReplayProtection(reqCtx, nonce, timestamp)
 		return replayErr
 	})
 	if replayErr != nil {
@@ -376,19 +427,37 @@ func sessionInitHandler(w http.ResponseWriter, r *http.Request) {
 	// Generate server ECDH keypair
 	var serverPriv *ecdh.PrivateKey
 	var serverPub []byte
+	var keygenErr error
 	metrics.Measure("ecdh-keygen", func() {
 		curve := ecdh.P256()
-		serverPriv, _ = curve.GenerateKey(rand.Reader)
-		serverPub = serverPriv.PublicKey().Bytes()
+		serverPriv, keygenErr = curve.GenerateKey(rand.Reader)
+		if keygenErr == nil {
+			serverPub = serverPriv.PublicKey().Bytes()
+		}
 	})
+	if keygenErr != nil {
+		log.Printf("ECDH keygen failed: %v", keygenErr)
+		sendError(w, http.StatusInternalServerError, "CRYPTO_ERROR")
+		return
+	}
 
 	// Compute shared secret
 	var sharedSecret []byte
+	var ecdhErr error
 	metrics.Measure("ecdh-compute", func() {
 		curve := ecdh.P256()
-		clientPubKey, _ := curve.NewPublicKey(clientPub)
-		sharedSecret, _ = serverPriv.ECDH(clientPubKey)
+		clientPubKey, err := curve.NewPublicKey(clientPub)
+		if err != nil {
+			ecdhErr = err
+			return
+		}
+		sharedSecret, ecdhErr = serverPriv.ECDH(clientPubKey)
 	})
+	if ecdhErr != nil {
+		log.Printf("ECDH compute failed: %v", ecdhErr)
+		sendError(w, http.StatusBadRequest, "CRYPTO_ERROR")
+		return
+	}
 
 	// Generate session ID
 	sessionID := generateSessionID("S")
@@ -410,14 +479,20 @@ func sessionInitHandler(w http.ResponseWriter, r *http.Request) {
 	salt := []byte(sessionID)
 	info := []byte(fmt.Sprintf("SESSION|A256GCM|%s", clientId))
 	var sessionKey []byte
+	var hkdfErr error
 	metrics.Measure("hkdf", func() {
-		sessionKey, _ = hkdf32(sharedSecret, salt, info)
+		sessionKey, hkdfErr = hkdf32(sharedSecret, salt, info)
 	})
+	if hkdfErr != nil {
+		log.Printf("HKDF key derivation failed: %v", hkdfErr)
+		sendError(w, http.StatusInternalServerError, "CRYPTO_ERROR")
+		return
+	}
 
-	// Store session in Redis
+	// Store session in PostgreSQL and Redis
 	var storeErr error
-	metrics.MeasureResult("redis-store", func() error {
-		storeErr = storeSession(sessionID, sessionKey, "AUTH", ttlSec)
+	metrics.MeasureResult("session-store", func() error {
+		storeErr = storeSession(reqCtx, sessionID, sessionKey, "AUTH", ttlSec)
 		return storeErr
 	})
 	if storeErr != nil {
@@ -462,9 +537,10 @@ func transactionPurchaseHandler(w http.ResponseWriter, r *http.Request) {
 	nonce := parts[1]
 
 	// Replay protection
+	reqCtx := r.Context()
 	var replayErr error
 	metrics.MeasureResult("replay-protection", func() error {
-		replayErr = validateReplayProtection(nonce, timestamp)
+		replayErr = validateReplayProtection(reqCtx, nonce, timestamp)
 		return replayErr
 	})
 	if replayErr != nil {
@@ -482,11 +558,11 @@ func transactionPurchaseHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get session from Redis
+	// Get session from store
 	var session *SessionData
 	var sessionErr error
-	metrics.MeasureResult("redis-get", func() error {
-		session, sessionErr = getSession(sessionID)
+	metrics.MeasureResult("session-get", func() error {
+		session, sessionErr = getSession(reqCtx, sessionID)
 		return sessionErr
 	})
 	if sessionErr != nil || session == nil {
@@ -555,7 +631,12 @@ func transactionPurchaseHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Encrypt response
-	responsePlaintext, _ := json.Marshal(responseData)
+	responsePlaintext, marshalErr := json.Marshal(responseData)
+	if marshalErr != nil {
+		log.Printf("Failed to marshal response: %v", marshalErr)
+		sendError(w, http.StatusInternalServerError, "INTERNAL_ERROR")
+		return
+	}
 	responseNonce := uuid.New().String()
 	responseTimestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
 	responseIdempotencyKey := fmt.Sprintf("%s.%s", responseTimestamp, responseNonce)
@@ -566,9 +647,15 @@ func transactionPurchaseHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Encrypt - returns IV || ciphertext || tag
 	var encryptedResponse []byte
+	var encryptErr error
 	metrics.Measure("aes-gcm-encrypt", func() {
-		encryptedResponse, _ = aesGcmEncrypt(sessionKey, responseAAD, responsePlaintext)
+		encryptedResponse, encryptErr = aesGcmEncrypt(sessionKey, responseAAD, responsePlaintext)
 	})
+	if encryptErr != nil {
+		log.Printf("Failed to encrypt response: %v", encryptErr)
+		sendError(w, http.StatusInternalServerError, "CRYPTO_ERROR")
+		return
+	}
 
 	// Set response headers
 	w.Header().Set("X-Kid", kid)
@@ -579,13 +666,19 @@ func transactionPurchaseHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
+	reqCtx := r.Context()
 	redisStatus := "ok"
-	if err := rdb.Ping(ctx).Err(); err != nil {
+	if err := rdb.Ping(reqCtx).Err(); err != nil {
 		redisStatus = "disconnected"
 	}
 
+	postgresStatus := "ok"
+	if err := dbPool.Ping(reqCtx); err != nil {
+		postgresStatus = "disconnected"
+	}
+
 	status := "ok"
-	if redisStatus != "ok" {
+	if redisStatus != "ok" || postgresStatus != "ok" {
 		status = "degraded"
 	}
 
@@ -593,6 +686,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 		Status:    status,
 		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
 		Redis:     redisStatus,
+		Postgres:  postgresStatus,
 	})
 }
 
@@ -625,10 +719,90 @@ func corsMiddleware(next http.Handler) http.Handler {
 }
 
 func main() {
+	// Initialize Postgres
+	pgHost := os.Getenv("POSTGRES_HOST")
+	if pgHost == "" {
+		pgHost = "127.0.0.1"
+	}
+	pgPort := os.Getenv("POSTGRES_PORT")
+	if pgPort == "" {
+		pgPort = "5432"
+	}
+	pgUser := os.Getenv("POSTGRES_USER")
+	if pgUser == "" {
+		pgUser = "postgres"
+	}
+	pgPass := os.Getenv("POSTGRES_PASSWORD")
+	if pgPass == "" {
+		pgPass = "postgres"
+	}
+	pgDB := os.Getenv("POSTGRES_DB")
+	if pgDB == "" {
+		pgDB = "session_crypto"
+	}
+	pgSSLMode := os.Getenv("POSTGRES_SSLMODE")
+	if pgSSLMode == "" {
+		pgSSLMode = "disable" // Use "require" in production
+	}
+
+	connStr := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=%s", pgUser, pgPass, pgHost, pgPort, pgDB, pgSSLMode)
+
+	// Parse config and set pool options
+	poolConfig, err := pgxpool.ParseConfig(connStr)
+	if err != nil {
+		log.Fatalf("Failed to parse database config: %v", err)
+	}
+
+	// Connection pool configuration
+	poolConfig.MaxConns = 25
+	poolConfig.MinConns = 5
+	poolConfig.MaxConnLifetime = 5 * time.Minute
+	poolConfig.MaxConnIdleTime = 1 * time.Minute
+
+	// Wait for Postgres to be ready with timeout
+	pgConnCtx, pgConnCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer pgConnCancel()
+
+	pgConnected := false
+	for i := 0; i < 10; i++ {
+		dbPool, err = pgxpool.NewWithConfig(pgConnCtx, poolConfig)
+		if err == nil {
+			if err := dbPool.Ping(pgConnCtx); err == nil {
+				log.Println("Connected to Postgres")
+				pgConnected = true
+				break
+			}
+			dbPool.Close()
+		}
+		log.Printf("Waiting for Postgres... (attempt %d/10)", i+1)
+		select {
+		case <-pgConnCtx.Done():
+			log.Fatalf("Timeout waiting for Postgres connection")
+		case <-time.After(time.Second):
+		}
+	}
+	if !pgConnected {
+		log.Fatalf("Failed to connect to Postgres after 10 attempts")
+	}
+
+	// Ensure table exists (Migration)
+	initCtx := context.Background()
+	_, err = dbPool.Exec(initCtx, `
+		CREATE TABLE IF NOT EXISTS sessions (
+		  session_id VARCHAR(255) PRIMARY KEY,
+		  data JSONB NOT NULL,
+		  expires_at BIGINT NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
+	`)
+	if err != nil {
+		log.Fatalf("Failed to ensure table exists: %v", err)
+	}
+
 	// Initialize Redis
 	redisHost := os.Getenv("REDIS_HOST")
 	if redisHost == "" {
-		redisHost = "localhost"
+		redisHost = "127.0.0.1"
 	}
 	redisPort := os.Getenv("REDIS_PORT")
 	if redisPort == "" {
@@ -641,7 +815,7 @@ func main() {
 
 	// Wait for Redis to be ready
 	for i := 0; i < 10; i++ {
-		if err := rdb.Ping(ctx).Err(); err == nil {
+		if err := rdb.Ping(initCtx).Err(); err == nil {
 			log.Println("Connected to Redis")
 			break
 		}
@@ -675,6 +849,7 @@ func main() {
 		defer cancel()
 		srv.Shutdown(ctx)
 		rdb.Close()
+		dbPool.Close()
 	}()
 
 	log.Println("Server listening on http://localhost:3000")

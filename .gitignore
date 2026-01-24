@@ -65,3 +65,5 @@ target/
 client/go/go-client
 client/go/client
 server-go/server
+server-go/server.exe
+server-go/session-crypto-server.exe

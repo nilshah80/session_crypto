@@ -12,13 +12,16 @@ use aws_lc_rs::{
     rand::{SecureRandom, SystemRandom},
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use deadpool_postgres::{Config, Pool, Runtime};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use std::{
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::Mutex;
+use tokio_postgres::NoTls;
+use postgres_native_tls::MakeTlsConnector;
+use native_tls::TlsConnector;
 use tower_http::{
     cors::{Any, CorsLayer},
     trace::TraceLayer,
@@ -31,9 +34,20 @@ const NONCE_TTL_SEC: u64 = 300; // 5 minutes
 const NONCE_PREFIX: &str = "nonce:";
 const SESSION_PREFIX: &str = "sess:";
 
+// Migration SQL for sessions table
+const MIGRATION_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id VARCHAR(255) PRIMARY KEY,
+    data JSONB NOT NULL,
+    expires_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
+"#;
+
 // App state
 struct AppState {
-    redis: Mutex<redis::aio::MultiplexedConnection>,
+    redis: redis::aio::ConnectionManager,
+    postgres: Pool,
     rng: SystemRandom,
 }
 
@@ -64,6 +78,7 @@ struct HealthResponse {
     status: String,
     timestamp: String,
     redis: String,
+    postgres: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -342,7 +357,7 @@ fn validate_p256_public_key(public_key_bytes: &[u8]) -> Result<(), &'static str>
 
 // Replay protection
 async fn validate_replay_protection(
-    redis: &mut redis::aio::MultiplexedConnection,
+    redis: &mut redis::aio::ConnectionManager,
     nonce: &str,
     timestamp: &str,
 ) -> Result<(), &'static str> {
@@ -374,12 +389,13 @@ async fn validate_replay_protection(
 
 // Session store operations
 async fn store_session(
-    redis: &mut redis::aio::MultiplexedConnection,
+    redis: &mut redis::aio::ConnectionManager,
+    postgres: &Pool,
     session_id: &str,
     key: &[u8],
     session_type: &str,
     ttl_sec: i32,
-) -> Result<(), redis::RedisError> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let expires_at = current_timestamp_ms() + (ttl_sec as i64) * 1000;
     let data = SessionData {
         key: b64_encode(key),
@@ -388,26 +404,102 @@ async fn store_session(
     };
 
     let json_data = serde_json::to_string(&data).unwrap();
+    let json_value = serde_json::to_value(&data).unwrap();
     let redis_key = format!("{}{}", SESSION_PREFIX, session_id);
 
+    // 1. Write to PostgreSQL (Source of Truth)
+    let pg_client = postgres.get().await?;
+    pg_client
+        .execute(
+            r#"INSERT INTO sessions (session_id, data, expires_at)
+               VALUES ($1, $2, $3)
+               ON CONFLICT (session_id) DO UPDATE
+               SET data = $2, expires_at = $3"#,
+            &[&session_id, &json_value, &expires_at],
+        )
+        .await?;
+
+    // 2. Write to Redis (Cache)
     redis
-        .set_ex::<_, _, ()>(&redis_key, json_data, ttl_sec as u64)
-        .await
+        .set_ex::<_, _, ()>(&redis_key, &json_data, ttl_sec as u64)
+        .await?;
+
+    Ok(())
 }
 
 async fn get_session(
-    redis: &mut redis::aio::MultiplexedConnection,
+    redis: &mut redis::aio::ConnectionManager,
+    postgres: &Pool,
     session_id: &str,
 ) -> Option<SessionData> {
     let redis_key = format!("{}{}", SESSION_PREFIX, session_id);
-    let value: Option<String> = redis.get(&redis_key).await.ok()?;
 
-    let value = value?;
-    let data: SessionData = serde_json::from_str(&value).ok()?;
+    // 1. Try Redis first
+    if let Ok(Some(value)) = redis.get::<_, Option<String>>(&redis_key).await {
+        if let Some(data) = parse_session(&value, session_id, redis, postgres).await {
+            return Some(data);
+        }
+    }
 
-    // Double-check expiry
+    // 2. Fallback to PostgreSQL
+    let pg_client = match postgres.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Failed to get Postgres connection: {:?}", e);
+            return None;
+        }
+    };
+
+    let row = match pg_client
+        .query_opt(
+            "SELECT data FROM sessions WHERE session_id = $1",
+            &[&session_id],
+        )
+        .await
+    {
+        Ok(Some(row)) => row,
+        Ok(None) => return None,
+        Err(e) => {
+            warn!("Failed to query session from Postgres: {:?}", e);
+            return None;
+        }
+    };
+
+    // Handle JSONB: postgres returns serde_json::Value with serde_json feature
+    let raw_data: serde_json::Value = row.get(0);
+    let db_value = raw_data.to_string();
+
+    let parsed = parse_session(&db_value, session_id, redis, postgres).await?;
+
+    // Populate Redis cache if valid
+    let ttl = ((parsed.expires_at - current_timestamp_ms()) / 1000).max(0) as u64;
+    if ttl > 0 {
+        let _: Result<(), _> = redis.set_ex::<_, _, ()>(&redis_key, &db_value, ttl).await;
+    }
+
+    Some(parsed)
+}
+
+async fn parse_session(
+    json_str: &str,
+    session_id: &str,
+    redis: &mut redis::aio::ConnectionManager,
+    postgres: &Pool,
+) -> Option<SessionData> {
+    let data: SessionData = serde_json::from_str(json_str).ok()?;
+
+    // Check if expired
     if current_timestamp_ms() > data.expires_at {
+        // Cleanup from both Redis and PostgreSQL
+        let redis_key = format!("{}{}", SESSION_PREFIX, session_id);
         let _: Result<(), _> = redis.del::<_, ()>(&redis_key).await;
+
+        // Cleanup from PostgreSQL
+        if let Ok(pg_client) = postgres.get().await {
+            let _ = pg_client
+                .execute("DELETE FROM sessions WHERE session_id = $1", &[&session_id])
+                .await;
+        }
         return None;
     }
 
@@ -445,7 +537,7 @@ async fn session_init_handler(
 
     // Replay protection
     {
-        let mut redis = state.redis.lock().await;
+        let mut redis = state.redis.clone();
         let result = metrics
             .measure_async("replay-protection", async {
                 validate_replay_protection(&mut redis, nonce, timestamp).await
@@ -506,12 +598,12 @@ async fn session_init_handler(
     let info = format!("SESSION|A256GCM|{}", client_id);
     let session_key = metrics.measure("hkdf", || hkdf32(&shared_secret, salt, info.as_bytes()));
 
-    // Store session in Redis
+    // Store session in PostgreSQL and Redis
     {
-        let mut redis = state.redis.lock().await;
+        let mut redis = state.redis.clone();
         let result = metrics
-            .measure_async("redis-store", async {
-                store_session(&mut redis, &session_id, &session_key, "AUTH", ttl_sec).await
+            .measure_async("db-store", async {
+                store_session(&mut redis, &state.postgres, &session_id, &session_key, "AUTH", ttl_sec).await
             })
             .await;
 
@@ -572,7 +664,7 @@ async fn transaction_purchase_handler(
 
     // Replay protection
     {
-        let mut redis = state.redis.lock().await;
+        let mut redis = state.redis.clone();
         let result = metrics
             .measure_async("replay-protection", async {
                 validate_replay_protection(&mut redis, nonce, timestamp).await
@@ -592,11 +684,11 @@ async fn transaction_purchase_handler(
         return error_response(StatusCode::BAD_REQUEST, "CRYPTO_ERROR", &metrics);
     };
 
-    // Get session from Redis
+    // Get session from Redis/PostgreSQL
     let session = {
-        let mut redis = state.redis.lock().await;
+        let mut redis = state.redis.clone();
         metrics
-            .measure_async("redis-get", async { get_session(&mut redis, session_id).await })
+            .measure_async("db-get", async { get_session(&mut redis, &state.postgres, session_id).await })
             .await
     };
 
@@ -692,10 +784,11 @@ async fn transaction_purchase_handler(
 }
 
 async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // Check Redis
     let redis_status = {
-        let mut redis = state.redis.lock().await;
+        let mut redis = state.redis.clone();
         match redis::cmd("PING")
-            .query_async::<String>(&mut *redis)
+            .query_async::<String>(&mut redis)
             .await
         {
             Ok(_) => "ok",
@@ -703,7 +796,16 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
         }
     };
 
-    let status = if redis_status == "ok" {
+    // Check PostgreSQL
+    let postgres_status = match state.postgres.get().await {
+        Ok(client) => match client.query_one("SELECT 1", &[]).await {
+            Ok(_) => "ok",
+            Err(_) => "disconnected",
+        },
+        Err(_) => "disconnected",
+    };
+
+    let status = if redis_status == "ok" && postgres_status == "ok" {
         "ok"
     } else {
         "degraded"
@@ -713,6 +815,7 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
         status: status.to_string(),
         timestamp: current_timestamp_iso(),
         redis: redis_status.to_string(),
+        postgres: postgres_status.to_string(),
     })
 }
 
@@ -762,13 +865,13 @@ async fn main() {
 
     let client = redis::Client::open(redis_url).expect("Failed to create Redis client");
 
-    // Wait for Redis to be ready
-    let mut conn = None;
+    // Wait for Redis to be ready using ConnectionManager (handles reconnection automatically)
+    let mut conn_mgr = None;
     for i in 0..10 {
-        match client.get_multiplexed_async_connection().await {
+        match redis::aio::ConnectionManager::new(client.clone()).await {
             Ok(c) => {
-                info!("Connected to Redis");
-                conn = Some(c);
+                info!("Connected to Redis (using ConnectionManager for automatic reconnection)");
+                conn_mgr = Some(c);
                 break;
             }
             Err(e) => {
@@ -778,10 +881,68 @@ async fn main() {
         }
     }
 
-    let conn = conn.expect("Failed to connect to Redis after 10 attempts");
+    let redis_conn = conn_mgr.expect("Failed to connect to Redis after 10 attempts");
+
+    // Initialize PostgreSQL
+    let pg_host = std::env::var("POSTGRES_HOST").unwrap_or_else(|_| "localhost".to_string());
+    let pg_port = std::env::var("POSTGRES_PORT").unwrap_or_else(|_| "5432".to_string());
+    let pg_user = std::env::var("POSTGRES_USER").unwrap_or_else(|_| "postgres".to_string());
+    let pg_password = std::env::var("POSTGRES_PASSWORD").unwrap_or_else(|_| "postgres".to_string());
+    let pg_db = std::env::var("POSTGRES_DB").unwrap_or_else(|_| "session_crypto".to_string());
+    let pg_ssl = std::env::var("POSTGRES_SSL").unwrap_or_else(|_| "false".to_string());
+
+    let mut pg_config = Config::new();
+    pg_config.host = Some(pg_host.clone());
+    pg_config.port = Some(pg_port.parse().unwrap_or(5432));
+    pg_config.user = Some(pg_user);
+    pg_config.password = Some(pg_password);
+    pg_config.dbname = Some(pg_db);
+    let mut pool_cfg = deadpool_postgres::PoolConfig::default();
+    pool_cfg.max_size = 25;
+    pg_config.pool = Some(pool_cfg);
+
+    // Create pool with or without TLS based on POSTGRES_SSL environment variable
+    let pg_pool = if pg_ssl == "true" || pg_ssl == "require" {
+        info!("PostgreSQL TLS enabled");
+        let tls_connector = TlsConnector::builder()
+            .danger_accept_invalid_certs(pg_ssl != "require") // Accept self-signed in non-strict mode
+            .build()
+            .expect("Failed to create TLS connector");
+        let connector = MakeTlsConnector::new(tls_connector);
+        pg_config
+            .create_pool(Some(Runtime::Tokio1), connector)
+            .expect("Failed to create PostgreSQL pool with TLS")
+    } else {
+        info!("PostgreSQL TLS disabled (set POSTGRES_SSL=true or POSTGRES_SSL=require to enable)");
+        pg_config
+            .create_pool(Some(Runtime::Tokio1), NoTls)
+            .expect("Failed to create PostgreSQL pool")
+    };
+
+    // Wait for PostgreSQL to be ready and run migration
+    for i in 0..10 {
+        match pg_pool.get().await {
+            Ok(client) => {
+                // Run migration
+                if let Err(e) = client.batch_execute(MIGRATION_SQL).await {
+                    warn!("Migration warning (may be OK if table exists): {:?}", e);
+                }
+                info!("Connected to PostgreSQL");
+                break;
+            }
+            Err(e) => {
+                info!("Waiting for PostgreSQL... (attempt {}): {:?}", i + 1, e);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if i == 9 {
+                    panic!("Failed to connect to PostgreSQL after 10 attempts");
+                }
+            }
+        }
+    }
 
     let state = Arc::new(AppState {
-        redis: Mutex::new(conn),
+        redis: redis_conn,
+        postgres: pg_pool,
         rng: SystemRandom::new(),
     });
 
