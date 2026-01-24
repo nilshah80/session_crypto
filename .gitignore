@@ -31,6 +31,8 @@ coverage/
 # .NET
 client/dotnet/**/bin/
 client/dotnet/**/obj/
+server-dotnet/bin/
+server-dotnet/obj/
 *.user
 *.suo
 
