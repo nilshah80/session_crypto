@@ -48,7 +48,7 @@ redis.on("error", (err) => {
 });
 
 // Initialize stores with Redis
-initSessionStore(redis);
+// Session store initialized in start()
 initReplayProtection(redis);
 
 // Enable CORS for browser clients (must be registered before routes)
@@ -359,6 +359,9 @@ const start = async () => {
       redis.once("error", reject);
       setTimeout(() => reject(new Error("Redis connection timeout")), 10000);
     });
+
+    // Initialize session store (connects to Postgres)
+    await initSessionStore(redis);
 
     await fastify.listen({ port: 3000, host: "0.0.0.0" });
     console.log("Server listening on http://localhost:3000");
