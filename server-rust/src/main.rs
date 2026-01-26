@@ -27,12 +27,16 @@ use tower_http::{
     trace::TraceLayer,
 };
 use tracing::{info, warn};
+use zeroize::Zeroize;
+use std::future::Future;
 
 // Constants
 const TIMESTAMP_WINDOW_MS: i64 = 5 * 60 * 1000; // ±5 minutes
 const NONCE_TTL_SEC: u64 = 300; // 5 minutes
 const NONCE_PREFIX: &str = "nonce:";
 const SESSION_PREFIX: &str = "sess:";
+const REDIS_TIMEOUT_SECS: u64 = 2;
+const POSTGRES_TIMEOUT_SECS: u64 = 3;
 
 // Migration SQL for sessions table
 const MIGRATION_SQL: &str = r#"
@@ -174,16 +178,16 @@ fn b64_decode(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
     BASE64.decode(s)
 }
 
-fn generate_session_id(prefix: &str, rng: &SystemRandom) -> String {
+fn generate_session_id(prefix: &str, rng: &SystemRandom) -> Result<String, aws_lc_rs::error::Unspecified> {
     let mut bytes = [0u8; 16];
-    rng.fill(&mut bytes).unwrap();
-    format!("{}-{}", prefix, hex::encode(bytes))
+    rng.fill(&mut bytes)?;
+    Ok(format!("{}-{}", prefix, hex::encode(bytes)))
 }
 
-fn generate_random_hex(n: usize, rng: &SystemRandom) -> String {
+fn generate_random_hex(n: usize, rng: &SystemRandom) -> Result<String, aws_lc_rs::error::Unspecified> {
     let mut bytes = vec![0u8; n];
-    rng.fill(&mut bytes).unwrap();
-    hex::encode(bytes)
+    rng.fill(&mut bytes)?;
+    Ok(hex::encode(bytes))
 }
 
 fn current_timestamp_ms() -> i64 {
@@ -294,7 +298,7 @@ fn aes_gcm_encrypt(
     rng: &SystemRandom,
 ) -> Result<Vec<u8>, aws_lc_rs::error::Unspecified> {
     let mut iv = [0u8; 12];
-    rng.fill(&mut iv).unwrap();
+    rng.fill(&mut iv)?;
 
     let unbound_key = aead::UnboundKey::new(&aead::AES_256_GCM, key)?;
     let mut sealing_key = aead::SealingKey::new(unbound_key, SingleUseNonce(Some(iv)));
@@ -355,6 +359,18 @@ fn validate_p256_public_key(public_key_bytes: &[u8]) -> Result<(), &'static str>
     Ok(())
 }
 
+// Timeout wrapper for async operations
+async fn with_timeout<T, F>(duration: Duration, future: F, operation: &str) -> Result<T, Box<dyn std::error::Error + Send + Sync>>
+where
+    F: Future<Output = Result<T, Box<dyn std::error::Error + Send + Sync>>>,
+{
+    tokio::time::timeout(duration, future)
+        .await
+        .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("Timeout: {}", operation).into()
+        })?
+}
+
 // Replay protection
 async fn validate_replay_protection(
     redis: &mut redis::aio::ConnectionManager,
@@ -403,26 +419,47 @@ async fn store_session(
         expires_at,
     };
 
-    let json_data = serde_json::to_string(&data).unwrap();
-    let json_value = serde_json::to_value(&data).unwrap();
+    let json_value = serde_json::to_value(&data)?;
+    let json_data = json_value.to_string();
     let redis_key = format!("{}{}", SESSION_PREFIX, session_id);
 
     // 1. Write to PostgreSQL (Source of Truth)
-    let pg_client = postgres.get().await?;
-    pg_client
-        .execute(
-            r#"INSERT INTO sessions (session_id, data, expires_at)
-               VALUES ($1, $2, $3)
-               ON CONFLICT (session_id) DO UPDATE
-               SET data = $2, expires_at = $3"#,
-            &[&session_id, &json_value, &expires_at],
-        )
-        .await?;
+    let pg_client = with_timeout(
+        Duration::from_secs(POSTGRES_TIMEOUT_SECS),
+        Box::pin(async {
+            postgres.get().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        }),
+        "PostgreSQL get connection"
+    ).await?;
+
+    with_timeout(
+        Duration::from_secs(POSTGRES_TIMEOUT_SECS),
+        Box::pin(async {
+            pg_client
+                .execute(
+                    r#"INSERT INTO sessions (session_id, data, expires_at)
+                       VALUES ($1, $2, $3)
+                       ON CONFLICT (session_id) DO UPDATE
+                       SET data = $2, expires_at = $3"#,
+                    &[&session_id, &json_value, &expires_at],
+                )
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        }),
+        "PostgreSQL insert session"
+    ).await?;
 
     // 2. Write to Redis (Cache)
-    redis
-        .set_ex::<_, _, ()>(&redis_key, &json_data, ttl_sec as u64)
-        .await?;
+    with_timeout(
+        Duration::from_secs(REDIS_TIMEOUT_SECS),
+        Box::pin(async {
+            redis
+                .set_ex::<_, _, ()>(&redis_key, &json_data, ttl_sec as u64)
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        }),
+        "Redis set session"
+    ).await?;
 
     Ok(())
 }
@@ -435,14 +472,29 @@ async fn get_session(
     let redis_key = format!("{}{}", SESSION_PREFIX, session_id);
 
     // 1. Try Redis first
-    if let Ok(Some(value)) = redis.get::<_, Option<String>>(&redis_key).await {
+    let redis_result = with_timeout(
+        Duration::from_secs(REDIS_TIMEOUT_SECS),
+        Box::pin(async {
+            redis.get::<_, Option<String>>(&redis_key).await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        }),
+        "Redis get session"
+    ).await;
+
+    if let Ok(Some(value)) = redis_result {
         if let Some(data) = parse_session(&value, session_id, redis, postgres).await {
             return Some(data);
         }
     }
 
     // 2. Fallback to PostgreSQL
-    let pg_client = match postgres.get().await {
+    let pg_client = match with_timeout(
+        Duration::from_secs(POSTGRES_TIMEOUT_SECS),
+        Box::pin(async {
+            postgres.get().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        }),
+        "PostgreSQL get connection"
+    ).await {
         Ok(c) => c,
         Err(e) => {
             warn!("Failed to get Postgres connection: {:?}", e);
@@ -450,13 +502,19 @@ async fn get_session(
         }
     };
 
-    let row = match pg_client
-        .query_opt(
-            "SELECT data FROM sessions WHERE session_id = $1",
-            &[&session_id],
-        )
-        .await
-    {
+    let row = match with_timeout(
+        Duration::from_secs(POSTGRES_TIMEOUT_SECS),
+        Box::pin(async {
+            pg_client
+                .query_opt(
+                    "SELECT data FROM sessions WHERE session_id = $1",
+                    &[&session_id],
+                )
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        }),
+        "PostgreSQL query session"
+    ).await {
         Ok(Some(row)) => row,
         Ok(None) => return None,
         Err(e) => {
@@ -474,7 +532,14 @@ async fn get_session(
     // Populate Redis cache if valid
     let ttl = ((parsed.expires_at - current_timestamp_ms()) / 1000).max(0) as u64;
     if ttl > 0 {
-        let _: Result<(), _> = redis.set_ex::<_, _, ()>(&redis_key, &db_value, ttl).await;
+        let _: Result<(), _> = with_timeout(
+            Duration::from_secs(REDIS_TIMEOUT_SECS),
+            Box::pin(async {
+                redis.set_ex::<_, _, ()>(&redis_key, &db_value, ttl).await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            }),
+            "Redis cache session"
+        ).await;
     }
 
     Some(parsed)
@@ -568,26 +633,51 @@ async fn session_init_handler(
     };
 
     // Generate server ECDH keypair
-    let server_private_key: EphemeralPrivateKey = metrics.measure("ecdh-keygen", || {
-        EphemeralPrivateKey::generate(&agreement::ECDH_P256, &state.rng).unwrap()
-    });
-    let server_pub = server_private_key.compute_public_key().unwrap();
+    let server_private_key: EphemeralPrivateKey = match metrics.measure("ecdh-keygen", || {
+        EphemeralPrivateKey::generate(&agreement::ECDH_P256, &state.rng)
+    }) {
+        Ok(key) => key,
+        Err(_) => {
+            warn!("Failed to generate ECDH keypair");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "CRYPTO_ERROR", &metrics);
+        }
+    };
+
+    let server_pub = match server_private_key.compute_public_key() {
+        Ok(pub_key) => pub_key,
+        Err(_) => {
+            warn!("Failed to compute server public key");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "CRYPTO_ERROR", &metrics);
+        }
+    };
     let server_pub_bytes = server_pub.as_ref().to_vec();
 
     // Compute shared secret
     let client_public_key = UnparsedPublicKey::new(&agreement::ECDH_P256, &client_pub);
-    let shared_secret: Vec<u8> = metrics.measure("ecdh-compute", || {
+    let mut shared_secret: Vec<u8> = match metrics.measure("ecdh-compute", || {
         agreement::agree_ephemeral(
             server_private_key,
             &client_public_key,
             aws_lc_rs::error::Unspecified,
             |secret: &[u8]| Ok::<_, aws_lc_rs::error::Unspecified>(secret.to_vec()),
         )
-        .unwrap()
-    });
+    }) {
+        Ok(secret) => secret,
+        Err(_) => {
+            warn!("Failed to compute shared secret");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "CRYPTO_ERROR", &metrics);
+        }
+    };
 
     // Generate session ID
-    let session_id = generate_session_id("S", &state.rng);
+    let session_id = match generate_session_id("S", &state.rng) {
+        Ok(id) => id,
+        Err(_) => {
+            shared_secret.zeroize();
+            warn!("Failed to generate session ID");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "CRYPTO_ERROR", &metrics);
+        }
+    };
 
     // Cap TTL between 5 minutes and 1 hour
     let ttl_sec = req.ttl_sec.unwrap_or(1800).clamp(300, 3600);
@@ -596,7 +686,10 @@ async fn session_init_handler(
     // Info includes client_id for domain separation
     let salt = session_id.as_bytes();
     let info = format!("SESSION|A256GCM|{}", client_id);
-    let session_key = metrics.measure("hkdf", || hkdf32(&shared_secret, salt, info.as_bytes()));
+    let mut session_key = metrics.measure("hkdf", || hkdf32(&shared_secret, salt, info.as_bytes()));
+
+    // Zeroize shared_secret after deriving session key
+    shared_secret.zeroize();
 
     // Store session in PostgreSQL and Redis
     {
@@ -608,6 +701,7 @@ async fn session_init_handler(
             .await;
 
         if let Err(e) = result {
+            session_key.zeroize();
             warn!("Failed to store session: {:?}", e);
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -617,7 +711,10 @@ async fn session_init_handler(
         }
     }
 
-    info!("Session created: {}, ttl: {}", session_id, ttl_sec);
+    // Zeroize session_key after storing
+    session_key.zeroize();
+
+    info!("Session created successfully, ttl: {}", ttl_sec);
 
     let response = SessionInitResponse {
         session_id,
@@ -712,17 +809,18 @@ async fn transaction_purchase_handler(
     }
 
     // Decode session key
-    let session_key = match b64_decode(&session.key) {
+    let mut session_key = match b64_decode(&session.key) {
         Ok(v) => v,
         Err(_) => return error_response(StatusCode::BAD_REQUEST, "CRYPTO_ERROR", &metrics),
     };
 
     // Decrypt request body (body contains IV || ciphertext || tag)
-    let plaintext = match metrics.measure("aes-gcm-decrypt", || {
+    let mut plaintext = match metrics.measure("aes-gcm-decrypt", || {
         aes_gcm_decrypt(&session_key, &aad, &encrypted_body)
     }) {
         Ok(p) => p,
         Err(_) => {
+            session_key.zeroize();
             warn!("Decryption failed");
             return error_response(StatusCode::BAD_REQUEST, "CRYPTO_ERROR", &metrics);
         }
@@ -732,17 +830,31 @@ async fn transaction_purchase_handler(
     let request_data: TransactionRequest = match serde_json::from_slice(&plaintext) {
         Ok(d) => d,
         Err(_) => {
+            plaintext.zeroize();
+            session_key.zeroize();
             warn!("Failed to parse decrypted JSON");
             return error_response(StatusCode::BAD_REQUEST, "CRYPTO_ERROR", &metrics);
         }
     };
 
-    info!("Decrypted request: {:?}", request_data);
+    // Zeroize plaintext after parsing
+    plaintext.zeroize();
+
+    info!("Transaction request received - scheme: {}, amount: {}", request_data.scheme_code, request_data.amount);
 
     // Business logic - process transaction
+    let transaction_id_hex = match generate_random_hex(8, &state.rng) {
+        Ok(hex) => hex,
+        Err(_) => {
+            session_key.zeroize();
+            warn!("Failed to generate transaction ID");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &metrics);
+        }
+    };
+
     let response_data = TransactionResponse {
         status: "SUCCESS".to_string(),
-        transaction_id: format!("TXN-{}", generate_random_hex(8, &state.rng).to_uppercase()),
+        transaction_id: format!("TXN-{}", transaction_id_hex.to_uppercase()),
         scheme_code: request_data.scheme_code.clone(),
         amount: request_data.amount,
         timestamp: current_timestamp_iso(),
@@ -753,7 +865,15 @@ async fn transaction_purchase_handler(
     };
 
     // Encrypt response
-    let response_plaintext = serde_json::to_vec(&response_data).unwrap();
+    let mut response_plaintext = match serde_json::to_vec(&response_data) {
+        Ok(v) => v,
+        Err(_) => {
+            session_key.zeroize();
+            warn!("Failed to serialize response");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &metrics);
+        }
+    };
+
     let response_nonce = uuid::Uuid::new_v4().to_string();
     let response_timestamp = current_timestamp_ms().to_string();
     let response_idempotency_key = format!("{}.{}", response_timestamp, response_nonce);
@@ -763,9 +883,21 @@ async fn transaction_purchase_handler(
     let response_aad = build_aad(&response_timestamp, &response_nonce, kid, client_id);
 
     // Encrypt - returns IV || ciphertext || tag
-    let encrypted_response = metrics.measure("aes-gcm-encrypt", || {
-        aes_gcm_encrypt(&session_key, &response_aad, &response_plaintext, &state.rng).unwrap()
-    });
+    let encrypted_response = match metrics.measure("aes-gcm-encrypt", || {
+        aes_gcm_encrypt(&session_key, &response_aad, &response_plaintext, &state.rng)
+    }) {
+        Ok(enc) => enc,
+        Err(_) => {
+            response_plaintext.zeroize();
+            session_key.zeroize();
+            warn!("Failed to encrypt response");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "CRYPTO_ERROR", &metrics);
+        }
+    };
+
+    // Zeroize sensitive data after encryption
+    response_plaintext.zeroize();
+    session_key.zeroize();
 
     // Build response with headers
     let mut response_headers = HeaderMap::new();
@@ -920,6 +1052,7 @@ async fn main() {
     };
 
     // Wait for PostgreSQL to be ready and run migration
+    let mut pg_connected = false;
     for i in 0..10 {
         match pg_pool.get().await {
             Ok(client) => {
@@ -928,16 +1061,19 @@ async fn main() {
                     warn!("Migration warning (may be OK if table exists): {:?}", e);
                 }
                 info!("Connected to PostgreSQL");
+                pg_connected = true;
                 break;
             }
             Err(e) => {
                 info!("Waiting for PostgreSQL... (attempt {}): {:?}", i + 1, e);
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                if i == 9 {
-                    panic!("Failed to connect to PostgreSQL after 10 attempts");
-                }
             }
         }
+    }
+
+    if !pg_connected {
+        eprintln!("ERROR: Failed to connect to PostgreSQL after 10 attempts");
+        std::process::exit(1);
     }
 
     let state = Arc::new(AppState {
@@ -972,13 +1108,22 @@ async fn main() {
         .with_state(state);
 
     // Start server
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    let listener = match tokio::net::TcpListener::bind("0.0.0.0:3000").await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("ERROR: Failed to bind to 0.0.0.0:3000: {:?}", e);
+            std::process::exit(1);
+        }
+    };
     info!("Server listening on http://localhost:3000");
 
-    axum::serve(listener, app)
+    if let Err(e) = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
-        .unwrap();
+    {
+        eprintln!("ERROR: Server error: {:?}", e);
+        std::process::exit(1);
+    }
 }
 
 async fn shutdown_signal() {

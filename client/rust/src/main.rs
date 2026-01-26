@@ -7,7 +7,8 @@ use aws_lc_rs::{
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
 use std::env;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use zeroize::Zeroize;
 
 const SERVER_URL: &str = "http://localhost:3000";
 
@@ -70,6 +71,12 @@ struct SessionContext {
     session_key: Vec<u8>,
     kid: String,
     client_id: String,
+}
+
+impl Drop for SessionContext {
+    fn drop(&mut self) {
+        self.session_key.zeroize();
+    }
 }
 
 // Client ID for this application
@@ -135,7 +142,7 @@ fn parse_server_timing(header: &str) -> Vec<CryptoTiming> {
 
 fn calculate_stats(durations: &[f64]) -> BenchmarkStats {
     let mut sorted = durations.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let n = sorted.len();
     let sum: f64 = sorted.iter().sum();
 
@@ -236,7 +243,11 @@ async fn main() {
 }
 
 async fn run_single() -> Result<(), Box<dyn std::error::Error>> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(10))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .build()?;
     let (session, init_metrics) = init_session(&client, true).await?;
     let purchase_metrics = make_purchase(
         &client,
@@ -260,7 +271,11 @@ async fn run_benchmark(iterations: usize) -> Result<(), Box<dyn std::error::Erro
     let mut combined_durations: Vec<f64> = Vec::with_capacity(iterations);
 
     // Reuse a single client for all iterations
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(10))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .build()?;
 
     println!("\n================================================================================");
     println!(
@@ -331,13 +346,19 @@ async fn init_session(
     // Generate client ECDH keypair (P-256)
     let (client_private_key, client_pub_bytes) =
         measure_sync("ecdh-keygen", &mut crypto_ops, || {
-            let private_key =
-                EphemeralPrivateKey::generate(&agreement::ECDH_P256, &rng).unwrap();
-            let public_key = private_key.compute_public_key().unwrap();
-            // ring returns uncompressed point format (65 bytes for P-256)
-            let pub_bytes = public_key.as_ref().to_vec();
-            (private_key, pub_bytes)
-        });
+            match EphemeralPrivateKey::generate(&agreement::ECDH_P256, &rng) {
+                Ok(private_key) => match private_key.compute_public_key() {
+                    Ok(public_key) => {
+                        // ring returns uncompressed point format (65 bytes for P-256)
+                        let pub_bytes = public_key.as_ref().to_vec();
+                        Ok((private_key, pub_bytes))
+                    }
+                    Err(e) => Err(e),
+                },
+                Err(e) => Err(e),
+            }
+        })
+        .map_err(|_| "ECDH keypair generation failed")?;
 
     if verbose {
         println!("  ✅ Generated client ECDH keypair");
@@ -406,15 +427,15 @@ async fn init_session(
         UnparsedPublicKey::new(&agreement::ECDH_P256, server_pub_bytes);
 
     // Compute shared secret using ECDH
-    let shared_secret: Vec<u8> = measure_sync("ecdh-compute", &mut crypto_ops, || {
+    let mut shared_secret: Vec<u8> = measure_sync("ecdh-compute", &mut crypto_ops, || {
         agreement::agree_ephemeral(
             client_private_key,
             &server_public_key,
             aws_lc_rs::error::Unspecified,
             |secret: &[u8]| Ok::<_, aws_lc_rs::error::Unspecified>(secret.to_vec()),
         )
-        .unwrap()
-    });
+    })
+    .map_err(|_| "ECDH agreement failed")?;
 
     if verbose {
         println!("\n  🔐 Computed ECDH shared secret");
@@ -427,11 +448,15 @@ async fn init_session(
         let prk = salt.extract(shared_secret.as_slice());
         let info_str = format!("SESSION|A256GCM|{}", CLIENT_ID);
         let info = &[info_str.as_bytes()];
-        let okm = prk.expand(info, HKDF_SHA256).unwrap();
+        let okm = prk.expand(info, HKDF_SHA256)?;
         let mut key = vec![0u8; 32];
-        okm.fill(&mut key).unwrap();
-        key
-    });
+        okm.fill(&mut key)?;
+        Ok::<_, aws_lc_rs::error::Unspecified>(key)
+    })
+    .map_err(|_| "HKDF key derivation failed")?;
+
+    // Zeroize shared secret
+    shared_secret.zeroize();
 
     if verbose {
         println!("  🔑 Derived session key using HKDF-SHA256");
@@ -476,7 +501,7 @@ async fn make_purchase(
         println!("\n📡 Step 2: Making encrypted purchase request...\n");
     }
 
-    let plaintext = serde_json::to_vec(&purchase_data)?;
+    let mut plaintext = serde_json::to_vec(&purchase_data)?;
 
     if verbose {
         println!("  📝 Request payload:");
@@ -513,24 +538,34 @@ async fn make_purchase(
     // Encrypt with AES-256-GCM - returns IV || ciphertext || tag
     let encrypted_body = measure_sync("aes-gcm-encrypt", &mut crypto_ops, || {
         let mut iv = [0u8; 12];
-        rng.fill(&mut iv).unwrap();
+        rng.fill(&mut iv)
+            .map_err(|_| "Failed to generate IV")?;
 
         let unbound_key =
-            aead::UnboundKey::new(&aead::AES_256_GCM, &session.session_key).unwrap();
+            aead::UnboundKey::new(&aead::AES_256_GCM, &session.session_key)
+                .map_err(|_| "Failed to create unbound key")?;
         let nonce_seq = SingleNonce::new(iv);
         let mut sealing_key = aead::SealingKey::new(unbound_key, nonce_seq);
 
         let mut in_out = plaintext.clone();
         let aad = Aad::from(aad_bytes);
-        let tag = sealing_key.seal_in_place_separate_tag(aad, &mut in_out).unwrap();
+        let tag = sealing_key.seal_in_place_separate_tag(aad, &mut in_out)
+            .map_err(|_| "Encryption failed")?;
 
         // Concatenate IV || ciphertext || tag
         let mut result = Vec::with_capacity(12 + in_out.len() + 16);
         result.extend_from_slice(&iv);
         result.extend_from_slice(&in_out);
         result.extend_from_slice(tag.as_ref());
-        result
-    });
+
+        // Zeroize in_out buffer after using it
+        in_out.zeroize();
+
+        Ok::<_, Box<dyn std::error::Error>>(result)
+    })?;
+
+    // Zeroize plaintext after encryption
+    plaintext.zeroize();
 
     if verbose {
         println!("     Encrypted body length: {} bytes (IV + ciphertext + tag)", encrypted_body.len());
@@ -607,14 +642,15 @@ async fn make_purchase(
     let resp_aad = format!("{}|{}|{}|{}", resp_timestamp, resp_nonce, resp_kid, session.client_id);
 
     // Decrypt response - body contains IV || ciphertext || tag
-    let resp_plaintext = measure_sync("aes-gcm-decrypt", &mut crypto_ops, || {
+    let mut resp_plaintext = measure_sync("aes-gcm-decrypt", &mut crypto_ops, || {
         // Extract IV (first 12 bytes)
         let resp_iv = &resp_encrypted_body[..12];
         // Rest is ciphertext || tag
         let ciphertext_with_tag = &resp_encrypted_body[12..];
 
         let unbound_key =
-            aead::UnboundKey::new(&aead::AES_256_GCM, &session.session_key).unwrap();
+            aead::UnboundKey::new(&aead::AES_256_GCM, &session.session_key)
+                .map_err(|_| "Failed to create unbound key for decryption")?;
         let mut resp_iv_arr = [0u8; 12];
         resp_iv_arr.copy_from_slice(resp_iv);
         let nonce_seq = SingleNonce::new(resp_iv_arr);
@@ -622,9 +658,10 @@ async fn make_purchase(
 
         let mut in_out = ciphertext_with_tag.to_vec();
         let aad = Aad::from(resp_aad.as_bytes());
-        let plaintext = opening_key.open_in_place(aad, &mut in_out).unwrap();
-        plaintext.to_vec()
-    });
+        let plaintext = opening_key.open_in_place(aad, &mut in_out)
+            .map_err(|_| "Decryption failed")?;
+        Ok::<_, Box<dyn std::error::Error>>(plaintext.to_vec())
+    })?;
 
     if verbose {
         let response_data: serde_json::Value = serde_json::from_slice(&resp_plaintext)?;
@@ -634,6 +671,9 @@ async fn make_purchase(
         println!("{}", serde_json::to_string_pretty(&response_data)?);
         println!("  ─────────────────────────────────────────");
     }
+
+    // Zeroize resp_plaintext before function ends
+    resp_plaintext.zeroize();
 
     Ok(EndpointMetrics {
         endpoint: "/transaction/purchase".to_string(),
