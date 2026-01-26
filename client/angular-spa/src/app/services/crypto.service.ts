@@ -199,4 +199,12 @@ export class CryptoService {
   buildAad(timestamp: string, nonce: string, kid: string, clientId: string): Uint8Array {
     return this.stringToBytes(`${timestamp}|${nonce}|${kid}|${clientId}`);
   }
+
+  // Zeroize sensitive data (best effort in browser environment)
+  // Note: JavaScript GC makes complete zeroization impossible, but this reduces exposure window
+  zeroize(data: Uint8Array): void {
+    if (data && data.length > 0) {
+      data.fill(0);
+    }
+  }
 }

@@ -109,17 +109,25 @@ export async function initSession(
     log(`     X-ClientId: ${CLIENT_ID}`);
   }
 
-  // Make HTTP request
+  // Make HTTP request with 30-second timeout
+  const abortController = new AbortController();
+  const timeoutId = setTimeout(() => abortController.abort(), 30000);
+
   const httpStart = performance.now();
-  const response = await fetch(`${SERVER_URL}/session/init`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Idempotency-Key': requestId,
-      'X-ClientId': CLIENT_ID
-    },
-    body: JSON.stringify(requestBody)
-  });
+  try {
+    var response = await fetch(`${SERVER_URL}/session/init`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Idempotency-Key': requestId,
+        'X-ClientId': CLIENT_ID
+      },
+      body: JSON.stringify(requestBody),
+      signal: abortController.signal
+    });
+  } finally {
+    clearTimeout(timeoutId);
+  }
   const httpMs = performance.now() - httpStart;
 
   if (!response.ok) {
@@ -153,6 +161,9 @@ export async function initSession(
   const sessionKey = await measure('hkdf', cryptoOps, () =>
     crypto.hkdf(sharedSecret, salt, info, 32)
   );
+
+  // Zeroize shared secret immediately after key derivation
+  crypto.zeroize(sharedSecret);
 
   if (verbose) {
     log('  🔑 Derived session key using HKDF-SHA256');
@@ -207,6 +218,9 @@ export async function makePurchase(
     crypto.aesGcmEncrypt(session.sessionKey, plaintext, aad)
   );
 
+  // Zeroize plaintext after encryption
+  crypto.zeroize(plaintext);
+
   if (verbose) {
     log('\n  🔒 Encrypting request...');
     log(`     AAD: ${timestamp}|${nonce.slice(0, 8)}...|session:${session.sessionId.slice(0, 8)}...|${session.clientId}`);
@@ -217,18 +231,26 @@ export async function makePurchase(
     log('\n  📤 Sending encrypted POST /transaction/purchase');
   }
 
-  // Make HTTP request with binary body
+  // Make HTTP request with binary body and 30-second timeout
+  const abortController = new AbortController();
+  const timeoutId = setTimeout(() => abortController.abort(), 30000);
+
   const httpStart = performance.now();
-  const response = await fetch(`${SERVER_URL}/transaction/purchase`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/octet-stream',
-      'X-Kid': session.kid,
-      'X-Idempotency-Key': requestId,
-      'X-ClientId': session.clientId
-    },
-    body: encrypted.encryptedBody
-  });
+  try {
+    var response = await fetch(`${SERVER_URL}/transaction/purchase`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'X-Kid': session.kid,
+        'X-Idempotency-Key': requestId,
+        'X-ClientId': session.clientId
+      },
+      body: encrypted.encryptedBody as BodyInit,
+      signal: abortController.signal
+    });
+  } finally {
+    clearTimeout(timeoutId);
+  }
   const httpMs = performance.now() - httpStart;
 
   if (!response.ok) {
@@ -281,6 +303,9 @@ export async function makePurchase(
     crypto.bytesToString(decrypted)
   );
 
+  // Zeroize decrypted response after parsing
+  crypto.zeroize(decrypted);
+
   if (verbose) {
     log('  ✅ Decryption successful!');
     log('\n  📋 Decrypted response:');
@@ -302,4 +327,11 @@ export async function makePurchase(
 
 export function getClientId(): string {
   return CLIENT_ID;
+}
+
+// Clear session and zeroize sensitive data
+export function clearSession(session: SessionContext): void {
+  if (session && session.sessionKey) {
+    crypto.zeroize(session.sessionKey);
+  }
 }

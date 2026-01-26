@@ -37,7 +37,7 @@ export async function computeSharedSecret(
 ): Promise<Uint8Array> {
   const peerPublicKey = await cryptoSubtle.importKey(
     'raw',
-    peerPublicKeyBytes,
+    peerPublicKeyBytes as BufferSource,
     { name: 'ECDH', namedCurve: 'P-256' },
     false,
     []
@@ -61,7 +61,7 @@ export async function hkdf(
 ): Promise<Uint8Array> {
   const keyMaterial = await cryptoSubtle.importKey(
     'raw',
-    sharedSecret,
+    sharedSecret as BufferSource,
     'HKDF',
     false,
     ['deriveBits']
@@ -71,8 +71,8 @@ export async function hkdf(
     {
       name: 'HKDF',
       hash: 'SHA-256',
-      salt,
-      info
+      salt: salt as BufferSource,
+      info: info as BufferSource
     },
     keyMaterial,
     length * 8
@@ -91,7 +91,7 @@ export async function aesGcmEncrypt(
 
   const aesKey = await cryptoSubtle.importKey(
     'raw',
-    key,
+    key as BufferSource,
     'AES-GCM',
     false,
     ['encrypt']
@@ -101,12 +101,12 @@ export async function aesGcmEncrypt(
   const ciphertextWithTag = await cryptoSubtle.encrypt(
     {
       name: 'AES-GCM',
-      iv,
-      additionalData: aad,
+      iv: iv as BufferSource,
+      additionalData: aad as BufferSource,
       tagLength: 128
     },
     aesKey,
-    plaintext
+    plaintext as BufferSource
   );
 
   // Concatenate: IV (12 bytes) || ciphertext || tag (16 bytes)
@@ -129,7 +129,7 @@ export async function aesGcmDecrypt(
 
   const aesKey = await cryptoSubtle.importKey(
     'raw',
-    key,
+    key as BufferSource,
     'AES-GCM',
     false,
     ['decrypt']
@@ -138,12 +138,12 @@ export async function aesGcmDecrypt(
   const plaintext = await cryptoSubtle.decrypt(
     {
       name: 'AES-GCM',
-      iv,
-      additionalData: aad,
+      iv: iv as BufferSource,
+      additionalData: aad as BufferSource,
       tagLength: 128
     },
     aesKey,
-    ciphertextWithTag
+    ciphertextWithTag as BufferSource
   );
 
   return new Uint8Array(plaintext);
@@ -186,4 +186,12 @@ export function buildAad(
   clientId: string
 ): Uint8Array {
   return stringToBytes(`${timestamp}|${nonce}|${kid}|${clientId}`);
+}
+
+// Zeroize sensitive data (best effort in browser environment)
+// Note: JavaScript GC makes complete zeroization impossible, but this reduces exposure window
+export function zeroize(data: Uint8Array): void {
+  if (data && data.length > 0) {
+    data.fill(0);
+  }
 }

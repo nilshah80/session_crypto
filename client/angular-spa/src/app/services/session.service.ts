@@ -1,6 +1,6 @@
 import { Injectable, inject } from '@angular/core';
 import { HttpClient, HttpHeaders, HttpResponse } from '@angular/common/http';
-import { firstValueFrom } from 'rxjs';
+import { firstValueFrom, timeout } from 'rxjs';
 import { CryptoService, KeyPair } from './crypto.service';
 
 export interface SessionInitResponse {
@@ -119,7 +119,7 @@ export class SessionService {
       console.log(`     X-ClientId: ${this.CLIENT_ID}`);
     }
 
-    // Make HTTP request
+    // Make HTTP request with 30-second timeout
     const httpStart = performance.now();
     const response = await firstValueFrom(
       this.http.post<SessionInitResponse>(
@@ -133,7 +133,7 @@ export class SessionService {
           }),
           observe: 'response'
         }
-      )
+      ).pipe(timeout(30000))
     );
     const httpMs = performance.now() - httpStart;
 
@@ -164,6 +164,9 @@ export class SessionService {
     const sessionKey = await this.measure('hkdf', cryptoOps, () =>
       this.crypto.hkdf(sharedSecret, salt, info, 32)
     );
+
+    // Zeroize shared secret immediately after key derivation
+    this.crypto.zeroize(sharedSecret);
 
     if (verbose) {
       console.log('  🔑 Derived session key using HKDF-SHA256');
@@ -221,6 +224,9 @@ export class SessionService {
       this.crypto.aesGcmEncrypt(session.sessionKey, plaintext, aad)
     );
 
+    // Zeroize plaintext after encryption
+    this.crypto.zeroize(plaintext);
+
     if (verbose) {
       console.log('\n  🔒 Encrypting request...');
       console.log(`     AAD: ${timestamp}|${nonce.slice(0, 8)}...|session:${session.sessionId.slice(0, 8)}...|${session.clientId}`);
@@ -239,7 +245,7 @@ export class SessionService {
       console.log('\n  📤 Sending encrypted POST /transaction/purchase');
     }
 
-    // Make HTTP request with binary body
+    // Make HTTP request with binary body and 30-second timeout
     // Wrap Uint8Array in Blob to ensure Angular sends it as raw binary
     const blob = new Blob([encrypted.encryptedBody], { type: 'application/octet-stream' });
     const httpStart = performance.now();
@@ -252,7 +258,7 @@ export class SessionService {
           observe: 'response',
           responseType: 'arraybuffer'
         }
-      )
+      ).pipe(timeout(30000))
     );
     const httpMs = performance.now() - httpStart;
 
@@ -302,6 +308,9 @@ export class SessionService {
       this.crypto.bytesToString(decrypted)
     );
 
+    // Zeroize decrypted response after parsing
+    this.crypto.zeroize(decrypted);
+
     if (verbose) {
       console.log('  ✅ Decryption successful!');
       console.log('\n  📋 Decrypted response:');
@@ -326,9 +335,13 @@ export class SessionService {
     return this.sessionContext;
   }
 
-  // Clear session
+  // Clear session and zeroize sensitive data
   clearSession(): void {
-    this.sessionContext = null;
+    if (this.sessionContext) {
+      // Zeroize session key before clearing context
+      this.crypto.zeroize(this.sessionContext.sessionKey);
+      this.sessionContext = null;
+    }
   }
 
   // Get client ID
