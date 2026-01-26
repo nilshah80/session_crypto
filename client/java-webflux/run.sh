@@ -2,25 +2,18 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-LIB_DIR="$SCRIPT_DIR/lib"
-SRC_DIR="$SCRIPT_DIR/src/main/java"
-OUT_DIR="$SCRIPT_DIR/out"
 
-# Create directories
-mkdir -p "$LIB_DIR" "$OUT_DIR"
-
-# Download Jackson dependencies if not present
-if [ ! -f "$LIB_DIR/jackson-databind-2.18.3.jar" ]; then
-    echo "Downloading dependencies..."
-    curl -sL -o "$LIB_DIR/jackson-databind-2.18.3.jar" "https://repo1.maven.org/maven2/com/fasterxml/jackson/core/jackson-databind/2.18.3/jackson-databind-2.18.3.jar"
-    curl -sL -o "$LIB_DIR/jackson-core-2.18.3.jar" "https://repo1.maven.org/maven2/com/fasterxml/jackson/core/jackson-core/2.18.3/jackson-core-2.18.3.jar"
-    curl -sL -o "$LIB_DIR/jackson-annotations-2.18.3.jar" "https://repo1.maven.org/maven2/com/fasterxml/jackson/core/jackson-annotations/2.18.3/jackson-annotations-2.18.3.jar"
+# Check if Maven is available
+if command -v mvn &> /dev/null; then
+    echo "Using Maven..."
+    cd "$SCRIPT_DIR"
+    mvn -q compile exec:java -Dexec.args="$*"
+elif command -v "/c/ProgramData/chocolatey/lib/maven/apache-maven-3.9.12/bin/mvn" &> /dev/null; then
+    echo "Using Maven (Chocolatey)..."
+    cd "$SCRIPT_DIR"
+    "/c/ProgramData/chocolatey/lib/maven/apache-maven-3.9.12/bin/mvn" -q compile exec:java -Dexec.args="$*"
+else
+    echo "Error: Maven not found. Please install Maven or use 'mvn compile exec:java' directly."
+    echo "Install Maven: choco install maven -y"
+    exit 1
 fi
-
-# Compile
-echo "Compiling..."
-javac --enable-preview --source 25 -cp "$LIB_DIR/*" -d "$OUT_DIR" "$SRC_DIR/com/example/SessionCryptoClient.java"
-
-# Run
-echo "Running..."
-java --enable-preview -cp "$OUT_DIR:$LIB_DIR/*" com.example.SessionCryptoClient "$@"

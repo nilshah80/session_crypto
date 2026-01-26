@@ -16,7 +16,7 @@ import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-import com.amazon.corretto.crypto.provider.AmazonCorrettoCryptoProvider;
+// import com.amazon.corretto.crypto.provider.AmazonCorrettoCryptoProvider;
 
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
@@ -35,8 +35,9 @@ public class SessionCryptoClient {
     // Install ACCP as the highest priority security provider (with fallback)
     static {
         try {
-            AmazonCorrettoCryptoProvider.install();
-            System.out.println("✓ Amazon Corretto Crypto Provider (ACCP) installed");
+            // AmazonCorrettoCryptoProvider.install();
+            // System.out.println("✓ Amazon Corretto Crypto Provider (ACCP) installed");
+            System.out.println("Using standard Java crypto (ACCP not configured)");
         } catch (Exception | NoClassDefFoundError e) {
             System.out.println("⚠ Amazon Corretto Crypto Provider (ACCP) not available, using default JCA");
             System.out.println("  Install ACCP for 10-50x better crypto performance");
@@ -294,6 +295,9 @@ public class SessionCryptoClient {
                 })
                 .block();  // Block to wait for completion
         }
+
+        // Gracefully shutdown reactor schedulers to prevent thread lingering warnings
+        Schedulers.shutdownNow();
     }
 
     // REACTIVE: Initialize session using Mono reactive streams

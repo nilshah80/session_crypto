@@ -22,7 +22,7 @@ import java.util.function.Supplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-import com.amazon.corretto.crypto.provider.AmazonCorrettoCryptoProvider;
+// import com.amazon.corretto.crypto.provider.AmazonCorrettoCryptoProvider;
 
 /**
  * Java Virtual Threads client with performance metrics and benchmark mode.
@@ -30,24 +30,25 @@ import com.amazon.corretto.crypto.provider.AmazonCorrettoCryptoProvider;
  * OPTIMIZED: Cipher reuse, buffer pooling, HTTP/2, pre-warming
  */
 public class SessionCryptoClient {
-    // Install ACCP as the highest priority security provider (with fallback)
-    static {
-        try {
-            AmazonCorrettoCryptoProvider.install();
-            System.out.println("✓ Amazon Corretto Crypto Provider (ACCP) installed");
-        } catch (Exception | NoClassDefFoundError e) {
-            System.out.println("⚠ Amazon Corretto Crypto Provider (ACCP) not available, using default JCA");
-            System.out.println("  Install ACCP for 10-50x better crypto performance");
-        }
-        prewarmCrypto();
-    }
-
     private static final String SERVER_URL = "http://localhost:3000";
     private static final String CLIENT_ID = "JAVA_VT_OPT_ACCP";
     private static final ObjectMapper mapper = new ObjectMapper();
 
     // Shared SecureRandom instance (thread-safe, avoid getInstanceStrong per request)
     private static final SecureRandom secureRandom = new SecureRandom();
+
+    // Install ACCP as the highest priority security provider (with fallback)
+    static {
+        try {
+            // AmazonCorrettoCryptoProvider.install();
+            // System.out.println("✓ Amazon Corretto Crypto Provider (ACCP) installed");
+            System.out.println("Using standard Java crypto (ACCP not configured)");
+        } catch (Exception | NoClassDefFoundError e) {
+            System.out.println("⚠ Amazon Corretto Crypto Provider (ACCP) not available, using default JCA");
+            System.out.println("  Install ACCP for 10-50x better crypto performance");
+        }
+        prewarmCrypto();
+    }
 
     // OPTIMIZATION: ThreadLocal buffer pools to avoid allocations
     private static final ThreadLocal<byte[]> IV_POOL = ThreadLocal.withInitial(() -> new byte[12]);
