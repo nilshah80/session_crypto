@@ -145,13 +145,17 @@ func b64Decode(s string) ([]byte, error) {
 
 func generateSessionID(prefix string) string {
 	b := make([]byte, 16)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		panic(fmt.Sprintf("Failed to generate random session ID: %v", err))
+	}
 	return fmt.Sprintf("%s-%s", prefix, hex.EncodeToString(b))
 }
 
 func generateRandomHex(n int) string {
 	b := make([]byte, n)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		panic(fmt.Sprintf("Failed to generate random hex: %v", err))
+	}
 	return hex.EncodeToString(b)
 }
 
@@ -179,7 +183,9 @@ func aesGcmEncrypt(key, aad, plaintext []byte) ([]byte, error) {
 
 	// Generate random IV
 	iv := make([]byte, 12)
-	rand.Read(iv)
+	if _, err := rand.Read(iv); err != nil {
+		return nil, fmt.Errorf("failed to generate IV: %w", err)
+	}
 
 	// Encrypt (returns ciphertext || tag)
 	sealed := aesgcm.Seal(nil, iv, plaintext, aad)
@@ -222,6 +228,14 @@ func buildAAD(ts, nonce, kid, clientId string) []byte {
 	return []byte(fmt.Sprintf("%s|%s|%s|%s", ts, nonce, kid, clientId))
 }
 
+// SECURITY: Clear sensitive byte slices
+// Go doesn't have SecureZeroMemory, so we manually zero each byte
+func clearBytes(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
+}
+
 // Validate P-256 public key is on curve
 func validateP256PublicKey(publicKeyBytes []byte) error {
 	// P-256 uncompressed point: 0x04 || X (32 bytes) || Y (32 bytes) = 65 bytes
@@ -256,8 +270,12 @@ func validateReplayProtection(reqCtx context.Context, nonce, timestamp string) e
 	}
 
 	// Nonce uniqueness check with Redis SET NX EX
+	// Add 2-second timeout for Redis operation
+	ctx, cancel := context.WithTimeout(reqCtx, 2*time.Second)
+	defer cancel()
+
 	key := noncePrefix + nonce
-	wasSet, err := rdb.SetNX(reqCtx, key, "1", time.Duration(nonceTTLSec)*time.Second).Result()
+	wasSet, err := rdb.SetNX(ctx, key, "1", time.Duration(nonceTTLSec)*time.Second).Result()
 	if err != nil {
 		return fmt.Errorf("REDIS_ERROR: %v", err)
 	}
@@ -271,6 +289,9 @@ func validateReplayProtection(reqCtx context.Context, nonce, timestamp string) e
 
 // Session store operations
 func storeSession(reqCtx context.Context, sessionID string, key []byte, sessionType string, ttlSec int) error {
+	// SECURITY: Clear key parameter when done
+	defer clearBytes(key)
+
 	expiresAt := time.Now().UnixMilli() + int64(ttlSec)*1000
 	data := SessionData{
 		Key:       b64Encode(key),
@@ -284,7 +305,11 @@ func storeSession(reqCtx context.Context, sessionID string, key []byte, sessionT
 	}
 
 	// 1. Write to PostgreSQL (Source of Truth)
-	_, err = dbPool.Exec(reqCtx, `
+	// Add 3-second timeout for DB operation
+	dbCtx, dbCancel := context.WithTimeout(reqCtx, 3*time.Second)
+	defer dbCancel()
+
+	_, err = dbPool.Exec(dbCtx, `
 		INSERT INTO sessions (session_id, data, expires_at)
 		VALUES ($1, $2, $3)
 		ON CONFLICT (session_id) DO UPDATE
@@ -295,12 +320,20 @@ func storeSession(reqCtx context.Context, sessionID string, key []byte, sessionT
 	}
 
 	// 2. Write to Redis (Cache)
-	return rdb.Set(reqCtx, sessionPrefix+sessionID, jsonData, time.Duration(ttlSec)*time.Second).Err()
+	// Add 2-second timeout for Redis operation
+	redisCtx, redisCancel := context.WithTimeout(reqCtx, 2*time.Second)
+	defer redisCancel()
+
+	return rdb.Set(redisCtx, sessionPrefix+sessionID, jsonData, time.Duration(ttlSec)*time.Second).Err()
 }
 
 func getSession(reqCtx context.Context, sessionID string) (*SessionData, error) {
 	// 1. Try Redis
-	value, err := rdb.Get(reqCtx, sessionPrefix+sessionID).Result()
+	// Add 1-second timeout for Redis read
+	redisCtx, redisCancel := context.WithTimeout(reqCtx, 1*time.Second)
+	defer redisCancel()
+
+	value, err := rdb.Get(redisCtx, sessionPrefix+sessionID).Result()
 	if err == nil {
 		var data SessionData
 		if err := json.Unmarshal([]byte(value), &data); err != nil {
@@ -320,8 +353,12 @@ func getSession(reqCtx context.Context, sessionID string) (*SessionData, error) 
 	}
 
 	// 2. Fallback to PostgreSQL
+	// Add 2-second timeout for DB read
+	dbCtx, dbCancel := context.WithTimeout(reqCtx, 2*time.Second)
+	defer dbCancel()
+
 	var dataJSON []byte
-	err = dbPool.QueryRow(reqCtx, "SELECT data FROM sessions WHERE session_id = $1", sessionID).Scan(&dataJSON)
+	err = dbPool.QueryRow(dbCtx, "SELECT data FROM sessions WHERE session_id = $1", sessionID).Scan(&dataJSON)
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
@@ -340,10 +377,12 @@ func getSession(reqCtx context.Context, sessionID string) (*SessionData, error) 
 		return nil, nil
 	}
 
-	// Populate Redis
+	// Populate Redis cache (fire and forget with short timeout)
 	ttl := time.Duration(data.ExpiresAt-time.Now().UnixMilli()) * time.Millisecond
 	if ttl > 0 {
-		rdb.Set(reqCtx, sessionPrefix+sessionID, dataJSON, ttl)
+		cacheCtx, cacheCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cacheCancel()
+		rdb.Set(cacheCtx, sessionPrefix+sessionID, dataJSON, ttl)
 	}
 
 	return &data, nil
@@ -458,6 +497,8 @@ func sessionInitHandler(w http.ResponseWriter, r *http.Request) {
 		sendError(w, http.StatusBadRequest, "CRYPTO_ERROR")
 		return
 	}
+	// SECURITY: Clear shared secret after HKDF
+	defer clearBytes(sharedSecret)
 
 	// Generate session ID
 	sessionID := generateSessionID("S")
@@ -596,6 +637,8 @@ func transactionPurchaseHandler(w http.ResponseWriter, r *http.Request) {
 		sendError(w, http.StatusBadRequest, "CRYPTO_ERROR")
 		return
 	}
+	// SECURITY: Clear session key when done
+	defer clearBytes(sessionKey)
 
 	// Decrypt request body (body contains IV || ciphertext || tag)
 	var plaintext []byte
@@ -609,6 +652,8 @@ func transactionPurchaseHandler(w http.ResponseWriter, r *http.Request) {
 		sendError(w, http.StatusBadRequest, "CRYPTO_ERROR")
 		return
 	}
+	// SECURITY: Clear decrypted plaintext after parsing
+	defer clearBytes(plaintext)
 
 	// Parse decrypted JSON
 	var requestData TransactionRequest
@@ -637,6 +682,9 @@ func transactionPurchaseHandler(w http.ResponseWriter, r *http.Request) {
 		sendError(w, http.StatusInternalServerError, "INTERNAL_ERROR")
 		return
 	}
+	// SECURITY: Clear response plaintext after encryption
+	defer clearBytes(responsePlaintext)
+
 	responseNonce := uuid.New().String()
 	responseTimestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
 	responseIdempotencyKey := fmt.Sprintf("%s.%s", responseTimestamp, responseNonce)
@@ -836,8 +884,11 @@ func main() {
 
 	// Graceful shutdown
 	srv := &http.Server{
-		Addr:    ":3000",
-		Handler: r,
+		Addr:         ":3000",
+		Handler:      r,
+		ReadTimeout:  10 * time.Second, // SECURITY: Prevent slowloris attacks
+		WriteTimeout: 10 * time.Second, // SECURITY: Prevent slow responses from hanging
+		IdleTimeout:  30 * time.Second, // SECURITY: Close idle connections
 	}
 
 	go func() {

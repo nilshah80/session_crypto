@@ -24,6 +24,16 @@ import (
 
 const serverURL = "http://localhost:3000"
 
+// HTTP client with timeout and connection pooling
+var httpClient = &http.Client{
+	Timeout: 30 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 // ===== Types =====
 
 type CryptoTiming struct {
@@ -67,11 +77,27 @@ type PurchaseRequest struct {
 	Amount     int    `json:"amount"`
 }
 
+// ===== Security Helpers =====
+
+// SECURITY: Clear sensitive byte slices
+// Go doesn't have SecureZeroMemory, so we manually zero each byte
+func clearBytes(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
+}
+
 type SessionContext struct {
 	SessionID  string
 	SessionKey []byte
 	Kid        string
 	ClientID   string
+}
+
+// Close clears sensitive data from SessionContext
+func (s *SessionContext) Close() {
+	// SECURITY: Clear session key
+	clearBytes(s.SessionKey)
 }
 
 // Client ID for this application
@@ -191,6 +217,8 @@ func main() {
 			fmt.Printf("\n❌ Error: %v\n", err)
 			os.Exit(1)
 		}
+		// SECURITY: Clear session key when done
+		defer session.Close()
 
 		purchaseMetrics, err := makePurchase(session, PurchaseRequest{SchemeCode: "AEF", Amount: 5000}, true)
 		if err != nil {
@@ -228,6 +256,7 @@ func runBenchmark(iterations int) error {
 
 		purchaseMetrics, err := makePurchase(session, PurchaseRequest{SchemeCode: "AEF", Amount: 5000}, false)
 		if err != nil {
+			session.Close() // Clear session key before returning on error
 			return err
 		}
 
@@ -238,6 +267,10 @@ func runBenchmark(iterations int) error {
 			purchaseDurations = append(purchaseDurations, purchaseMetrics.TotalRoundTripMs)
 			combinedDurations = append(combinedDurations, flowDuration)
 		}
+
+		// SECURITY: Clear session key at end of each iteration (not defer in loop!)
+		// Using defer inside loop accumulates all defers until function returns
+		session.Close()
 
 		if (i+1)%10 == 0 || i == iterations+warmup-1 {
 			progress := i + 1 - warmup
@@ -310,7 +343,7 @@ func initSession(verbose bool) (*SessionContext, *EndpointMetrics, error) {
 	req.Header.Set("X-ClientId", clientID)
 
 	httpStart := time.Now()
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	httpMs := float64(time.Since(httpStart).Microseconds()) / 1000.0
 
 	if err != nil {
@@ -321,7 +354,10 @@ func initSession(verbose bool) (*SessionContext, *EndpointMetrics, error) {
 	serverTiming := resp.Header.Get("Server-Timing")
 
 	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			return nil, nil, fmt.Errorf("session init failed: %d (failed to read error body: %v)", resp.StatusCode, readErr)
+		}
 		return nil, nil, fmt.Errorf("session init failed: %d - %s", resp.StatusCode, string(body))
 	}
 
@@ -359,6 +395,8 @@ func initSession(verbose bool) (*SessionContext, *EndpointMetrics, error) {
 		}
 		return nil
 	})
+	// SECURITY: Clear shared secret after HKDF
+	defer clearBytes(sharedSecret)
 
 	if verbose {
 		fmt.Println("\n  🔐 Computed ECDH shared secret")
@@ -408,6 +446,8 @@ func makePurchase(session *SessionContext, purchaseData PurchaseRequest, verbose
 	}
 
 	plaintext, _ := json.Marshal(purchaseData)
+	// SECURITY: Clear request plaintext after encryption
+	defer clearBytes(plaintext)
 
 	if verbose {
 		fmt.Println("  📝 Request payload:")
@@ -436,7 +476,9 @@ func makePurchase(session *SessionContext, purchaseData PurchaseRequest, verbose
 	var encryptedBody []byte
 	measureSync("aes-gcm-encrypt", &cryptoOps, func() any {
 		iv := make([]byte, 12)
-		rand.Read(iv)
+		if _, err := rand.Read(iv); err != nil {
+			panic(fmt.Sprintf("Failed to generate IV: %v", err))
+		}
 		ciphertextWithTag := aesGCM.Seal(nil, iv, plaintext, aad)
 		encryptedBody = append(iv, ciphertextWithTag...) // IV || ciphertext || tag
 		return nil
@@ -455,7 +497,7 @@ func makePurchase(session *SessionContext, purchaseData PurchaseRequest, verbose
 	req.Header.Set("X-ClientId", session.ClientID)
 
 	httpStart := time.Now()
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	httpMs := float64(time.Since(httpStart).Microseconds()) / 1000.0
 
 	if err != nil {
@@ -466,7 +508,10 @@ func makePurchase(session *SessionContext, purchaseData PurchaseRequest, verbose
 	serverTiming := resp.Header.Get("Server-Timing")
 
 	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			return nil, fmt.Errorf("purchase failed: %d (failed to read error body: %v)", resp.StatusCode, readErr)
+		}
 		return nil, fmt.Errorf("purchase failed: %d - %s", resp.StatusCode, string(body))
 	}
 
@@ -497,7 +542,10 @@ func makePurchase(session *SessionContext, purchaseData PurchaseRequest, verbose
 	respAad := []byte(fmt.Sprintf("%s|%s|%s|%s", respTimestamp, respNonce, respKid, session.ClientID))
 
 	// Get encrypted body (IV || ciphertext || tag)
-	respEncryptedBody, _ := io.ReadAll(resp.Body)
+	respEncryptedBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
 
 	if verbose {
 		fmt.Printf("     Encrypted body length: %d bytes\n", len(respEncryptedBody))
@@ -516,6 +564,8 @@ func makePurchase(session *SessionContext, purchaseData PurchaseRequest, verbose
 		}
 		return nil
 	})
+	// SECURITY: Clear decrypted response data
+	defer clearBytes(respPlaintext)
 
 	if verbose {
 		var responseData map[string]interface{}
