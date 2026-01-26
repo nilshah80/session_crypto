@@ -223,9 +223,6 @@ fn current_timestamp_iso() -> String {
 // Simple ISO timestamp formatter without chrono dependency
 fn chrono_lite(secs: i64, millis: u32) -> String {
     const SECS_PER_DAY: i64 = 86400;
-    const DAYS_PER_400Y: i64 = 146097;
-    const DAYS_PER_100Y: i64 = 36524;
-    const DAYS_PER_4Y: i64 = 1461;
 
     let mut days = secs / SECS_PER_DAY;
     let mut rem_secs = (secs % SECS_PER_DAY) as u32;
@@ -234,43 +231,18 @@ fn chrono_lite(secs: i64, millis: u32) -> String {
         rem_secs = (SECS_PER_DAY as u32) - rem_secs;
     }
 
-    days += 719468;
-
-    let mut year = 1;
-    let mut q = days / DAYS_PER_400Y;
-    year += q * 400;
-    days -= q * DAYS_PER_400Y;
-
-    q = days / DAYS_PER_100Y;
-    if q == 4 { q = 3; }
-    year += q * 100;
-    days -= q * DAYS_PER_100Y;
-
-    q = days / DAYS_PER_4Y;
-    year += q * 4;
-    days -= q * DAYS_PER_4Y;
-
-    q = days / 365;
-    if q == 4 { q = 3; }
-    year += q;
-    days -= q * 365;
-
-    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    let month_days: [i64; 12] = if leap {
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    } else {
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    };
-
-    let mut month = 0;
-    for (i, &d) in month_days.iter().enumerate() {
-        if days < d {
-            month = i + 1;
-            break;
-        }
-        days -= d;
-    }
-    let day = days + 1;
+    // Civil date algorithm from Howard Hinnant
+    // https://howardhinnant.github.io/date_algorithms.html
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
 
     let hour = rem_secs / 3600;
     rem_secs %= 3600;
@@ -279,7 +251,7 @@ fn chrono_lite(secs: i64, millis: u32) -> String {
 
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-        year, month, day, hour, minute, second, millis
+        year, m, d, hour, minute, second, millis
     )
 }
 

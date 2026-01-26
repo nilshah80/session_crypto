@@ -69,3 +69,4 @@ client/go/client
 server-go/server
 *.exe
 nul
+*.txt
