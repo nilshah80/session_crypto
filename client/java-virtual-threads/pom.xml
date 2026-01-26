@@ -43,10 +43,7 @@
                 <version>3.1.0</version>
                 <configuration>
                     <mainClass>com.example.SessionCryptoClient</mainClass>
-                    <arguments>
-                        <argument>${exec.args}</argument>
-                    </arguments>
-                    <commandlineArgs>--enable-preview</commandlineArgs>
+                    <commandlineArgs>${exec.args} --enable-preview</commandlineArgs>
                 </configuration>
             </plugin>
         </plugins>
