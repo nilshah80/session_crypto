@@ -5,6 +5,27 @@ import { Redis } from "ioredis";
 export const b64 = (buf: Buffer): string => buf.toString("base64");
 export const unb64 = (s: string): Buffer => Buffer.from(s, "base64");
 
+// OPTIMIZATION: Buffer pool for IV reuse
+// NOTE: This pool is NOT thread-safe. It's safe for single-threaded Node.js event loop,
+// but would require synchronization (e.g., locks or per-thread pools) if crypto operations
+// are moved to worker threads or if Node.js is run in cluster mode with shared state.
+// For multi-threaded scenarios, consider: AsyncLocalStorage-based pools, per-request buffers,
+// or thread-safe queue implementations.
+const ivPool: Buffer[] = [];
+const IV_POOL_MAX_SIZE = 100;
+
+function getIVBuffer(): Buffer {
+  return ivPool.pop() || Buffer.allocUnsafe(12);
+}
+
+function returnIVBuffer(buf: Buffer): void {
+  if (ivPool.length < IV_POOL_MAX_SIZE) {
+    // SECURITY: Clear IV before reusing
+    buf.fill(0);
+    ivPool.push(buf);
+  }
+}
+
 // Create ECDH keypair using P-256 curve
 export function createEcdhKeypair() {
   const ecdh = crypto.createECDH("prime256v1"); // P-256
@@ -22,20 +43,44 @@ export function hkdf32(
 }
 
 // AES-256-GCM encryption - returns IV || ciphertext || tag
+// OPTIMIZED: Uses buffer pooling and optimized concatenation
 export function aesGcmEncrypt(
   key32: Buffer,
   aad: Buffer,
   plaintext: Buffer
 ): Buffer {
-  const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv("aes-256-gcm", key32, iv);
-  cipher.setAAD(aad);
-  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
-  const tag = cipher.getAuthTag();
-  return Buffer.concat([iv, ciphertext, tag]); // IV (12) || ciphertext || tag (16)
+  // Get IV from pool
+  const iv = getIVBuffer();
+  crypto.randomFillSync(iv);
+
+  try {
+    const cipher = crypto.createCipheriv("aes-256-gcm", key32, iv);
+    cipher.setAAD(aad);
+
+    // OPTIMIZATION: Pre-allocate result buffer to avoid multiple Buffer.concat()
+    const result = Buffer.allocUnsafe(12 + plaintext.length + 16);
+
+    // Copy IV
+    iv.copy(result, 0, 0, 12);
+
+    // Encrypt and copy ciphertext
+    const updateResult = cipher.update(plaintext);
+    updateResult.copy(result, 12);
+    const finalResult = cipher.final();
+    finalResult.copy(result, 12 + updateResult.length);
+
+    // Copy auth tag
+    const tag = cipher.getAuthTag();
+    tag.copy(result, result.length - 16);
+
+    return result;
+  } finally {
+    returnIVBuffer(iv);
+  }
 }
 
 // AES-256-GCM decryption - expects IV || ciphertext || tag
+// OPTIMIZED: Avoids Buffer.concat()
 export function aesGcmDecrypt(
   key32: Buffer,
   aad: Buffer,
@@ -48,7 +93,19 @@ export function aesGcmDecrypt(
   const decipher = crypto.createDecipheriv("aes-256-gcm", key32, iv);
   decipher.setAAD(aad);
   decipher.setAuthTag(tag);
-  return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+
+  // OPTIMIZATION: Pre-allocate result buffer
+  const updateResult = decipher.update(ciphertext);
+  const finalResult = decipher.final();
+
+  if (finalResult.length === 0) {
+    return updateResult;
+  }
+
+  const result = Buffer.allocUnsafe(updateResult.length + finalResult.length);
+  updateResult.copy(result, 0);
+  finalResult.copy(result, updateResult.length);
+  return result;
 }
 
 // Build AAD from request components

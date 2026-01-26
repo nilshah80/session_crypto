@@ -9,35 +9,73 @@ import javax.crypto.KeyAgreement;
 import javax.crypto.Mac;
 import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.security.*;
 import java.security.spec.*;
 import java.util.*;
-import java.util.concurrent.CompletableFuture;
-import java.util.function.Supplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import com.amazon.corretto.crypto.provider.AmazonCorrettoCryptoProvider;
+
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
+import reactor.netty.http.client.HttpClient;
+import reactor.netty.http.client.HttpClientResponse;
+import io.netty.handler.codec.http.HttpHeaderNames;
+import io.netty.handler.codec.http.HttpHeaderValues;
+import io.netty.handler.codec.http.HttpMethod;
+
 /**
- * Java WebFlux-style client with performance metrics and benchmark mode.
- * Uses CompletableFuture for reactive programming patterns.
+ * Java WebFlux-style client with PROPER reactive programming using Project Reactor.
+ * Uses Mono/Flux reactive streams with reactor-netty for truly reactive HTTP.
+ * Optimized with cipher reuse, buffer pooling, and ACCP native crypto.
  */
 public class SessionCryptoClient {
+    // Install ACCP as the highest priority security provider (with fallback)
+    static {
+        try {
+            AmazonCorrettoCryptoProvider.install();
+            System.out.println("✓ Amazon Corretto Crypto Provider (ACCP) installed");
+        } catch (Exception | NoClassDefFoundError e) {
+            System.out.println("⚠ Amazon Corretto Crypto Provider (ACCP) not available, using default JCA");
+            System.out.println("  Install ACCP for 10-50x better crypto performance");
+        }
+
+        // OPTIMIZATION: Pre-warm crypto operations to avoid first-call JIT penalty
+        try {
+            KeyPairGenerator warmupGen = KeyPairGenerator.getInstance("EC");
+            warmupGen.initialize(new ECGenParameterSpec("secp256r1"));
+            KeyPair warmupPair = warmupGen.generateKeyPair();
+
+            Cipher warmupCipher = Cipher.getInstance("AES/GCM/NoPadding");
+            SecretKeySpec warmupKey = new SecretKeySpec(new byte[32], "AES");
+            GCMParameterSpec warmupSpec = new GCMParameterSpec(128, new byte[12]);
+            warmupCipher.init(Cipher.ENCRYPT_MODE, warmupKey, warmupSpec);
+            warmupCipher.doFinal(new byte[16]);
+
+            System.out.println("✓ Crypto operations pre-warmed");
+        } catch (Exception e) {
+            System.err.println("Warning: Crypto pre-warming failed: " + e.getMessage());
+        }
+    }
+
     private static final String SERVER_URL = "http://localhost:3000";
-    private static final String CLIENT_ID = "JAVA_WF_CLIENT";
+    private static final String CLIENT_ID = "JAVA_REACTIVE_CLIENT_ACCP";
     private static final ObjectMapper mapper = new ObjectMapper();
 
-    // Shared SecureRandom instance (thread-safe, avoid getInstanceStrong per request)
+    // Shared SecureRandom instance (thread-safe)
     private static final SecureRandom secureRandom = new SecureRandom();
 
-    // Async HttpClient with connection pooling
-    private static final HttpClient httpClient = HttpClient.newBuilder()
-        .version(HttpClient.Version.HTTP_1_1)
-        .build();
+    // OPTIMIZATION: ThreadLocal buffer pools to reduce GC pressure
+    private static final ThreadLocal<byte[]> IV_POOL = ThreadLocal.withInitial(() -> new byte[12]);
+    private static final ThreadLocal<byte[]> TEMP_BUFFER = ThreadLocal.withInitial(() -> new byte[8192]);
+
+    // REACTIVE: reactor-netty HTTP client with timeouts
+    private static final HttpClient httpClient = HttpClient.create()
+        .compress(true)
+        .responseTimeout(java.time.Duration.ofSeconds(30))
+        .option(io.netty.channel.ChannelOption.CONNECT_TIMEOUT_MILLIS, 15000);
 
     // ===== Metrics Types =====
     record CryptoTiming(String operation, double durationMs) {}
@@ -63,12 +101,101 @@ public class SessionCryptoClient {
 
     record InitResult(SessionContext session, EndpointMetrics metrics) {}
 
+    // Helper classes for passing data through reactive chains
+    static class InitData {
+        KeyPair clientKeyPair;
+        byte[] clientPubRaw;
+        String nonce;
+        String timestamp;
+        String requestId;
+        List<CryptoTiming> cryptoOps = new ArrayList<>();
+        long totalStart = System.nanoTime();
+    }
+
+    static class InitResponseData {
+        InitData initData;
+        String responseBody;
+        double httpMs;
+        String serverTiming;
+
+        InitResponseData(InitData initData, String responseBody, double httpMs, String serverTiming) {
+            this.initData = initData;
+            this.responseBody = responseBody;
+            this.httpMs = httpMs;
+            this.serverTiming = serverTiming;
+        }
+    }
+
+    static class EncryptData {
+        byte[] plaintext;
+        String nonce;
+        String timestamp;
+        String requestId;
+        byte[] aad;
+        byte[] encryptedBody;
+        List<CryptoTiming> cryptoOps = new ArrayList<>();
+        long totalStart = System.nanoTime();
+    }
+
+    static class PurchaseResponseData {
+        EncryptData encryptData;
+        byte[] responseBody;
+        double httpMs;
+        String serverTiming;
+        String respKid;
+        String respRequestId;
+
+        PurchaseResponseData(EncryptData encryptData, byte[] responseBody, double httpMs,
+                           String serverTiming, String respKid, String respRequestId) {
+            this.encryptData = encryptData;
+            this.responseBody = responseBody;
+            this.httpMs = httpMs;
+            this.serverTiming = serverTiming;
+            this.respKid = respKid;
+            this.respRequestId = respRequestId;
+        }
+    }
+
+    // OPTIMIZATION: Session context with cached Cipher instances for reuse
+    static class SessionContext implements AutoCloseable {
+        final String sessionId;
+        final byte[] sessionKey;
+        final String kid;
+        final String clientId;
+        final Cipher encryptCipher;
+        final Cipher decryptCipher;
+        final SecretKeySpec keySpec;
+
+        SessionContext(String sessionId, byte[] sessionKey, String kid, String clientId) throws Exception {
+            this.sessionId = sessionId;
+            this.sessionKey = sessionKey;
+            this.kid = kid;
+            this.clientId = clientId;
+            this.keySpec = new SecretKeySpec(sessionKey, "AES");
+
+            // OPTIMIZATION: Pre-create and cache Cipher instances per session
+            this.encryptCipher = Cipher.getInstance("AES/GCM/NoPadding");
+            this.decryptCipher = Cipher.getInstance("AES/GCM/NoPadding");
+        }
+
+        @Override
+        public void close() {
+            // Clear sensitive data
+            Arrays.fill(sessionKey, (byte) 0);
+        }
+    }
+
     // ===== Metrics Helpers =====
-    static <T> T measureSync(String operation, List<CryptoTiming> timings, Supplier<T> fn) {
+    static <T> T measureSync(String operation, List<CryptoTiming> timings, ThrowingSupplier<T> fn) throws Exception {
         long start = System.nanoTime();
         T result = fn.get();
         timings.add(new CryptoTiming(operation, (System.nanoTime() - start) / 1_000_000.0));
         return result;
+    }
+
+    @FunctionalInterface
+    interface ThrowingSupplier<T> {
+        T get() throws Exception;
     }
 
     static List<CryptoTiming> parseServerTiming(String header) {
@@ -110,10 +237,10 @@ public class SessionCryptoClient {
 
     public static void main(String[] args) {
         System.out.println("═══════════════════════════════════════════════════════════════");
-        System.out.println("  Session Crypto PoC - Java WebFlux-style Client");
+        System.out.println("  Session Crypto PoC - Java Reactive WebFlux Client");
         System.out.println("═══════════════════════════════════════════════════════════════");
         System.out.println("  Server: " + SERVER_URL);
-        System.out.println("  Using: CompletableFuture (Reactive Patterns)");
+        System.out.println("  Using: Project Reactor (Mono/Flux) + reactor-netty");
 
         // Parse benchmark flag
         boolean isBenchmark = false;
@@ -134,321 +261,339 @@ public class SessionCryptoClient {
         final boolean runBenchmark = isBenchmark;
         final int iterations = benchmarkIterations;
 
-        // Chain reactive operations
+        // REACTIVE: Chain operations using Mono
         if (runBenchmark) {
-            runBenchmarkAsync(iterations)
-                .thenRun(() -> {
+            runBenchmarkReactive(iterations)
+                .doOnSuccess(v -> {
                     System.out.println("═══════════════════════════════════════════════════════════════");
                     System.out.println("  ✅ Benchmark completed successfully!");
                     System.out.println("═══════════════════════════════════════════════════════════════\n");
                 })
-                .exceptionally(e -> {
+                .doOnError(e -> {
                     System.out.println("\n❌ Error: " + e.getMessage());
                     e.printStackTrace();
-                    System.exit(1);
-                    return null;
                 })
-                .join();
+                .block();  // Block to wait for completion
         } else {
-            initSessionAsync(true)
-                .thenCompose(initResult ->
-                    makePurchaseAsync(initResult.session(), new PurchaseRequest("AEF", 5000), true)
-                        .thenApply(purchaseMetrics -> new EndpointMetrics[] { initResult.metrics(), purchaseMetrics })
-                )
-                .thenAccept(metrics -> {
+            initSessionReactive(true)
+                .flatMap(initResult -> {
+                    // SECURITY: Ensure session is closed after use
+                    return makePurchaseReactive(initResult.session(), new PurchaseRequest("AEF", 5000), true)
+                        .map(purchaseMetrics -> new EndpointMetrics[] { initResult.metrics(), purchaseMetrics })
+                        .doFinally(signal -> initResult.session().close());
+                })
+                .doOnSuccess(metrics -> {
                     printMetricsSummary(metrics[0], metrics[1]);
                     System.out.println("═══════════════════════════════════════════════════════════════");
                     System.out.println("  ✅ Completed successfully!");
                     System.out.println("═══════════════════════════════════════════════════════════════\n");
                 })
-                .exceptionally(e -> {
+                .doOnError(e -> {
                     System.out.println("\n❌ Error: " + e.getMessage());
                     e.printStackTrace();
-                    System.exit(1);
-                    return null;
                 })
-                .join();
+                .block();  // Block to wait for completion
         }
     }
 
-    static CompletableFuture<InitResult> initSessionAsync(boolean verbose) {
-        return CompletableFuture.supplyAsync(() -> {
+    // REACTIVE: Initialize session using Mono reactive streams
+    static Mono<InitResult> initSessionReactive(boolean verbose) {
+        // REACTIVE CHAIN: Generate keypair -> Build request -> HTTP call -> Process response
+        return Mono.fromCallable(() -> {
+            InitData data = new InitData();
+
+            if (verbose) {
+                System.out.println("\n📡 Step 1: Initializing session with server...\n");
+            }
+
+            // Generate client ECDH keypair (P-256)
+            data.clientKeyPair = measureSync("ecdh-keygen", data.cryptoOps, () -> {
+                KeyPairGenerator keyGen = KeyPairGenerator.getInstance("EC");
+                keyGen.initialize(new ECGenParameterSpec("secp256r1"));
+                return keyGen.generateKeyPair();
+            });
+
+            data.clientPubRaw = extractRawPublicKey(data.clientKeyPair.getPublic());
+
+            if (verbose) {
+                System.out.println("  ✅ Generated client ECDH keypair");
+                System.out.println("     Public key (first 32 chars): " +
+                    Base64.getEncoder().encodeToString(data.clientPubRaw).substring(0, 32) + "...");
+            }
+
+            data.nonce = UUID.randomUUID().toString();
+            data.timestamp = String.valueOf(System.currentTimeMillis());
+            data.requestId = data.timestamp + "." + data.nonce;
+
+            if (verbose) {
+                System.out.println("\n  📤 Sending POST /session/init (reactive)");
+                System.out.println("     X-Idempotency-Key: " + data.requestId);
+                System.out.println("     X-ClientId: " + CLIENT_ID);
+            }
+
+            return data;
+        })
+        .subscribeOn(Schedulers.parallel())  // Run crypto on parallel scheduler
+        .flatMap(data -> {
+            // REACTIVE HTTP CALL using reactor-netty
             try {
-                long totalStart = System.nanoTime();
-                List<CryptoTiming> cryptoOps = new ArrayList<>();
-
-                if (verbose) {
-                    System.out.println("\n📡 Step 1: Initializing session with server...\n");
-                }
-
-                // Generate client ECDH keypair (P-256)
-                KeyPair clientKeyPair = measureSync("ecdh-keygen", cryptoOps, () -> {
-                    try {
-                        KeyPairGenerator keyGen = KeyPairGenerator.getInstance("EC");
-                        keyGen.initialize(new ECGenParameterSpec("secp256r1"));
-                        return keyGen.generateKeyPair();
-                    } catch (Exception e) {
-                        throw new RuntimeException(e);
-                    }
-                });
-
-                byte[] clientPubRaw = extractRawPublicKey(clientKeyPair.getPublic());
-                if (verbose) {
-                    System.out.println("  ✅ Generated client ECDH keypair");
-                    System.out.println("     Public key (first 32 chars): " +
-                        Base64.getEncoder().encodeToString(clientPubRaw).substring(0, 32) + "...");
-                }
-
-                String nonce = UUID.randomUUID().toString();
-                String timestamp = String.valueOf(System.currentTimeMillis());
-                String requestId = timestamp + "." + nonce;
-
-                if (verbose) {
-                    System.out.println("\n  📤 Sending POST /session/init (async)");
-                    System.out.println("     X-Idempotency-Key: " + requestId);
-                    System.out.println("     X-ClientId: " + CLIENT_ID);
-                }
-
                 SessionInitRequest requestBody = new SessionInitRequest(
-                    Base64.getEncoder().encodeToString(clientPubRaw),
+                    Base64.getEncoder().encodeToString(data.clientPubRaw),
                     1800
                 );
 
-                HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(SERVER_URL + "/session/init"))
-                    .header("Content-Type", "application/json")
-                    .header("X-Idempotency-Key", requestId)
-                    .header("X-ClientId", CLIENT_ID)
-                    .POST(HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(requestBody)))
-                    .build();
+                String jsonBody = mapper.writeValueAsString(requestBody);
+                byte[] bodyBytes = jsonBody.getBytes(StandardCharsets.UTF_8);
 
-                // Send async and wait
                 long httpStart = System.nanoTime();
-                HttpResponse<String> response = httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString()).join();
-                double httpMs = (System.nanoTime() - httpStart) / 1_000_000.0;
 
-                if (response.statusCode() != 200) {
-                    throw new RuntimeException("Session init failed: " + response.statusCode() + " - " + response.body());
-                }
+                return httpClient
+                    .headers(h -> {
+                        h.set(HttpHeaderNames.CONTENT_TYPE, HttpHeaderValues.APPLICATION_JSON);
+                        h.set("X-Idempotency-Key", data.requestId);
+                        h.set("X-ClientId", CLIENT_ID);
+                    })
+                    .request(HttpMethod.POST)
+                    .uri(SERVER_URL + "/session/init")
+                    .send((req, out) -> out.sendByteArray(Mono.just(bodyBytes)))
+                    .responseSingle((response, body) -> {
+                        double httpMs = (System.nanoTime() - httpStart) / 1_000_000.0;
 
-                String serverTiming = response.headers().firstValue("Server-Timing").orElse(null);
-                SessionInitResponse data = mapper.readValue(response.body(), SessionInitResponse.class);
+                        if (response.status().code() != 200) {
+                            return body.asString().flatMap(err ->
+                                Mono.error(new RuntimeException("Session init failed: " + response.status() + " - " + err))
+                            );
+                        }
 
-                if (verbose) {
-                    System.out.println("\n  📥 Received response:");
-                    System.out.println("     Session ID: " + data.sessionId);
-                    System.out.println("     Encryption: " + data.encAlg);
-                    System.out.println("     Expires in: " + data.expiresInSec + " seconds");
-                    System.out.println("     Server public key (first 32 chars): " +
-                        data.serverPublicKey.substring(0, 32) + "...");
-                }
+                        String serverTiming = response.responseHeaders().get("Server-Timing");
 
-                // Import server public key
-                byte[] serverPubRaw = Base64.getDecoder().decode(data.serverPublicKey);
-                PublicKey serverPubKey = importRawPublicKey(serverPubRaw);
-
-                // Compute shared secret
-                byte[] sharedSecret = measureSync("ecdh-compute", cryptoOps, () -> {
-                    try {
-                        KeyAgreement keyAgreement = KeyAgreement.getInstance("ECDH");
-                        keyAgreement.init(clientKeyPair.getPrivate());
-                        keyAgreement.doPhase(serverPubKey, true);
-                        return keyAgreement.generateSecret();
-                    } catch (Exception e) {
-                        throw new RuntimeException(e);
-                    }
-                });
-
-                if (verbose) {
-                    System.out.println("\n  🔐 Computed ECDH shared secret");
-                }
-
-                // Derive session key using HKDF
-                // Info includes clientId for domain separation
-                byte[] salt = data.sessionId.getBytes(StandardCharsets.UTF_8);
-                byte[] info = ("SESSION|A256GCM|" + CLIENT_ID).getBytes(StandardCharsets.UTF_8);
-                byte[] sessionKey = measureSync("hkdf", cryptoOps, () -> {
-                    try {
-                        return hkdf(sharedSecret, salt, info, 32);
-                    } catch (Exception e) {
-                        throw new RuntimeException(e);
-                    }
-                });
-
-                if (verbose) {
-                    System.out.println("  🔑 Derived session key using HKDF-SHA256");
-                    System.out.println("     Session key (first 16 chars): " +
-                        Base64.getEncoder().encodeToString(sessionKey).substring(0, 16) + "...");
-                }
-
-                EndpointMetrics metrics = new EndpointMetrics(
-                    "/session/init",
-                    (System.nanoTime() - totalStart) / 1_000_000.0,
-                    httpMs,
-                    cryptoOps,
-                    serverTiming
-                );
-
-                return new InitResult(
-                    new SessionContext(data.sessionId, sessionKey, "session:" + data.sessionId, CLIENT_ID),
-                    metrics
-                );
+                        return body.asString().map(responseBody -> {
+                            return new InitResponseData(data, responseBody, httpMs, serverTiming);
+                        });
+                    });
             } catch (Exception e) {
-                throw new RuntimeException(e);
+                return Mono.error(e);
             }
-        });
+        })
+        .flatMap(responseData -> Mono.fromCallable(() -> {
+            // Process response and compute shared secret (CPU-bound)
+            InitData data = responseData.initData;
+
+            SessionInitResponse sessionData = mapper.readValue(responseData.responseBody, SessionInitResponse.class);
+
+            if (verbose) {
+                System.out.println("\n  📥 Received response:");
+                System.out.println("     Session ID: " + sessionData.sessionId);
+                System.out.println("     Encryption: " + sessionData.encAlg);
+                System.out.println("     Expires in: " + sessionData.expiresInSec + " seconds");
+                System.out.println("     Server public key (first 32 chars): " +
+                    sessionData.serverPublicKey.substring(0, 32) + "...");
+            }
+
+            // Import server public key
+            byte[] serverPubRaw = Base64.getDecoder().decode(sessionData.serverPublicKey);
+            PublicKey serverPubKey = importRawPublicKey(serverPubRaw);
+
+            // Compute shared secret
+            byte[] sharedSecret = measureSync("ecdh-compute", data.cryptoOps, () -> {
+                KeyAgreement keyAgreement = KeyAgreement.getInstance("ECDH");
+                keyAgreement.init(data.clientKeyPair.getPrivate());
+                keyAgreement.doPhase(serverPubKey, true);
+                return keyAgreement.generateSecret();
+            });
+
+            if (verbose) {
+                System.out.println("\n  🔐 Computed ECDH shared secret");
+            }
+
+            // Derive session key using HKDF
+            byte[] salt = sessionData.sessionId.getBytes(StandardCharsets.UTF_8);
+            byte[] info = ("SESSION|A256GCM|" + CLIENT_ID).getBytes(StandardCharsets.UTF_8);
+            byte[] sessionKey = measureSync("hkdf", data.cryptoOps, () -> {
+                return hkdf(sharedSecret, salt, info, 32);
+            });
+
+            if (verbose) {
+                System.out.println("  🔑 Derived session key using HKDF-SHA256");
+                System.out.println("     Session key (first 16 chars): " +
+                    Base64.getEncoder().encodeToString(sessionKey).substring(0, 16) + "...");
+            }
+
+            EndpointMetrics metrics = new EndpointMetrics(
+                "/session/init",
+                (System.nanoTime() - data.totalStart) / 1_000_000.0,
+                responseData.httpMs,
+                data.cryptoOps,
+                responseData.serverTiming
+            );
+
+            return new InitResult(
+                new SessionContext(sessionData.sessionId, sessionKey, "session:" + sessionData.sessionId, CLIENT_ID),
+                metrics
+            );
+        }).subscribeOn(Schedulers.parallel()));  // Run crypto on parallel scheduler
     }
 
-    static CompletableFuture<EndpointMetrics> makePurchaseAsync(SessionContext session, PurchaseRequest purchaseData, boolean verbose) {
-        return CompletableFuture.supplyAsync(() -> {
-            try {
-                long totalStart = System.nanoTime();
-                List<CryptoTiming> cryptoOps = new ArrayList<>();
+    // REACTIVE: Make purchase using Mono reactive streams
+    static Mono<EndpointMetrics> makePurchaseReactive(SessionContext session, PurchaseRequest purchaseData, boolean verbose) {
+        return Mono.fromCallable(() -> {
+            EncryptData data = new EncryptData();
 
-                if (verbose) {
-                    System.out.println("\n📡 Step 2: Making encrypted purchase request...\n");
-                }
+            if (verbose) {
+                System.out.println("\n📡 Step 2: Making encrypted purchase request...\n");
+            }
 
-                byte[] plaintext = mapper.writeValueAsBytes(purchaseData);
-                if (verbose) {
-                    System.out.println("  📝 Request payload:");
-                    System.out.println("     " + mapper.writeValueAsString(purchaseData));
-                }
+            data.plaintext = mapper.writeValueAsBytes(purchaseData);
+            if (verbose) {
+                System.out.println("  📝 Request payload:");
+                System.out.println("     " + mapper.writeValueAsString(purchaseData));
+            }
 
-                // Generate nonce and timestamp for replay protection
-                String nonce = UUID.randomUUID().toString();
-                String timestamp = String.valueOf(System.currentTimeMillis());
-                String requestId = timestamp + "." + nonce;
+            // Generate nonce and timestamp for replay protection
+            data.nonce = UUID.randomUUID().toString();
+            data.timestamp = String.valueOf(System.currentTimeMillis());
+            data.requestId = data.timestamp + "." + data.nonce;
 
-                // Build AAD
-                // Format: TIMESTAMP|NONCE|KID|CLIENTID
-                String aadStr = timestamp + "|" + nonce + "|" + session.kid + "|" + session.clientId;
-                byte[] aad = aadStr.getBytes(StandardCharsets.UTF_8);
+            // Build AAD: TIMESTAMP|NONCE|KID|CLIENTID
+            String aadStr = data.timestamp + "|" + data.nonce + "|" + session.kid + "|" + session.clientId;
+            data.aad = aadStr.getBytes(StandardCharsets.UTF_8);
 
-                if (verbose) {
-                    System.out.println("\n  🔒 Encrypting request...");
-                    System.out.println("     AAD: " + timestamp + "|" +
-                        nonce.substring(0, 8) + "...|session:" + session.sessionId.substring(0, 8) + "...|" + session.clientId);
-                }
+            if (verbose) {
+                System.out.println("\n  🔒 Encrypting request...");
+                System.out.println("     AAD: " + data.timestamp + "|" +
+                    data.nonce.substring(0, 8) + "...|session:" + session.sessionId.substring(0, 8) + "...|" + session.clientId);
+            }
 
-                // Encrypt with AES-256-GCM - returns IV || ciphertext || tag
-                byte[] encryptedBody = measureSync("aes-gcm-encrypt", cryptoOps, () -> {
-                    try {
-                        byte[] iv = new byte[12];
-                        secureRandom.nextBytes(iv);
+            // OPTIMIZATION: Encrypt with reused Cipher instance (synchronized for thread safety)
+            data.encryptedBody = measureSync("aes-gcm-encrypt", data.cryptoOps, () -> {
+                byte[] iv = IV_POOL.get();
+                try {
+                    secureRandom.nextBytes(iv);
 
-                        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
-                        SecretKeySpec keySpec = new SecretKeySpec(session.sessionKey, "AES");
+                    synchronized (session.encryptCipher) {
                         GCMParameterSpec gcmSpec = new GCMParameterSpec(128, iv);
-                        cipher.init(Cipher.ENCRYPT_MODE, keySpec, gcmSpec);
-                        cipher.updateAAD(aad);
-                        byte[] ciphertextWithTag = cipher.doFinal(plaintext);
+                        session.encryptCipher.init(Cipher.ENCRYPT_MODE, session.keySpec, gcmSpec);
+                        session.encryptCipher.updateAAD(data.aad);
+                        byte[] ciphertextWithTag = session.encryptCipher.doFinal(data.plaintext);
 
-                        // Concatenate: IV (12) || ciphertext || tag (already appended by Java)
+                        // Concatenate: IV (12) || ciphertext || tag
                         byte[] result = new byte[12 + ciphertextWithTag.length];
                         System.arraycopy(iv, 0, result, 0, 12);
                         System.arraycopy(ciphertextWithTag, 0, result, 12, ciphertextWithTag.length);
                         return result;
-                    } catch (Exception e) {
-                        throw new RuntimeException(e);
                     }
-                });
-
-                if (verbose) {
-                    System.out.println("     Encrypted body length: " + encryptedBody.length + " bytes (IV + ciphertext + tag)");
-                    System.out.println("\n  📤 Sending encrypted POST /transaction/purchase (async)");
+                } finally {
+                    // SECURITY: Clear IV from ThreadLocal buffer
+                    Arrays.fill(iv, (byte) 0);
                 }
+            });
 
-                HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(SERVER_URL + "/transaction/purchase"))
-                    .header("Content-Type", "application/octet-stream")
-                    .header("X-Kid", session.kid)
-                    .header("X-Idempotency-Key", requestId)
-                    .header("X-ClientId", session.clientId)
-                    .POST(HttpRequest.BodyPublishers.ofByteArray(encryptedBody))
-                    .build();
-
-                // Send async and wait
-                long httpStart = System.nanoTime();
-                HttpResponse<byte[]> response = httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofByteArray()).join();
-                double httpMs = (System.nanoTime() - httpStart) / 1_000_000.0;
-
-                if (response.statusCode() != 200) {
-                    throw new RuntimeException("Purchase failed: " + response.statusCode() + " - " + new String(response.body()));
-                }
-
-                String serverTiming = response.headers().firstValue("Server-Timing").orElse(null);
-
-                // Extract response headers
-                String respKid = response.headers().firstValue("X-Kid").orElseThrow();
-                String respRequestId = response.headers().firstValue("X-Idempotency-Key").orElseThrow();
-
-                if (verbose) {
-                    System.out.println("\n  📥 Received encrypted response (status: " + response.statusCode() + ")");
-                    System.out.println("     Response headers:");
-                    System.out.println("       X-Kid: " + respKid);
-                    System.out.println("       X-Idempotency-Key: " + respRequestId.substring(0, Math.min(30, respRequestId.length())) + "...");
-                }
-
-                // Parse response request ID to get timestamp and nonce for AAD reconstruction
-                String[] respParts = respRequestId.split("\\.");
-                if (respParts.length != 2) {
-                    throw new RuntimeException("Invalid X-Idempotency-Key format in response");
-                }
-                String respTimestamp = respParts[0];
-                String respNonce = respParts[1];
-
-                // Reconstruct AAD from response headers
-                byte[] respAad = (respTimestamp + "|" + respNonce + "|" + respKid + "|" + session.clientId)
-                    .getBytes(StandardCharsets.UTF_8);
-
-                // Get encrypted body (IV || ciphertext || tag)
-                byte[] respEncryptedBody = response.body();
-
-                if (verbose) {
-                    System.out.println("     Encrypted body length: " + respEncryptedBody.length + " bytes");
-                    System.out.println("\n  🔓 Decrypting response...");
-                }
-
-                byte[] respPlaintext = measureSync("aes-gcm-decrypt", cryptoOps, () -> {
-                    try {
-                        // Extract IV (first 12 bytes) and ciphertext+tag (rest)
-                        byte[] respIv = new byte[12];
-                        System.arraycopy(respEncryptedBody, 0, respIv, 0, 12);
-                        byte[] respCiphertextWithTag = new byte[respEncryptedBody.length - 12];
-                        System.arraycopy(respEncryptedBody, 12, respCiphertextWithTag, 0, respCiphertextWithTag.length);
-
-                        Cipher decCipher = Cipher.getInstance("AES/GCM/NoPadding");
-                        SecretKeySpec decKeySpec = new SecretKeySpec(session.sessionKey, "AES");
-                        GCMParameterSpec decGcmSpec = new GCMParameterSpec(128, respIv);
-                        decCipher.init(Cipher.DECRYPT_MODE, decKeySpec, decGcmSpec);
-                        decCipher.updateAAD(respAad);
-                        return decCipher.doFinal(respCiphertextWithTag);
-                    } catch (Exception e) {
-                        throw new RuntimeException(e);
-                    }
-                });
-
-                if (verbose) {
-                    JsonNode responseData = mapper.readTree(respPlaintext);
-                    System.out.println("  ✅ Decryption successful!\n");
-                    System.out.println("  📋 Decrypted response:");
-                    System.out.println("  ─────────────────────────────────────────");
-                    System.out.println(mapper.writerWithDefaultPrettyPrinter().writeValueAsString(responseData));
-                    System.out.println("  ─────────────────────────────────────────");
-                }
-
-                return new EndpointMetrics(
-                    "/transaction/purchase",
-                    (System.nanoTime() - totalStart) / 1_000_000.0,
-                    httpMs,
-                    cryptoOps,
-                    serverTiming
-                );
-            } catch (Exception e) {
-                throw new RuntimeException(e);
+            if (verbose) {
+                System.out.println("     Encrypted body length: " + data.encryptedBody.length + " bytes (IV + ciphertext + tag)");
+                System.out.println("\n  📤 Sending encrypted POST /transaction/purchase (reactive)");
             }
-        });
+
+            return data;
+        })
+        .subscribeOn(Schedulers.parallel())  // Run crypto on parallel scheduler
+        .flatMap(data -> {
+            // REACTIVE HTTP CALL
+            byte[] bodyBytes = data.encryptedBody;
+            long httpStart = System.nanoTime();
+
+            return httpClient
+                .headers(h -> {
+                    h.set(HttpHeaderNames.CONTENT_TYPE, "application/octet-stream");
+                    h.set("X-Kid", session.kid);
+                    h.set("X-Idempotency-Key", data.requestId);
+                    h.set("X-ClientId", session.clientId);
+                })
+                .request(HttpMethod.POST)
+                .uri(SERVER_URL + "/transaction/purchase")
+                .send((req, out) -> out.sendByteArray(Mono.just(bodyBytes)))
+                .responseSingle((response, body) -> {
+                    double httpMs = (System.nanoTime() - httpStart) / 1_000_000.0;
+
+                    if (response.status().code() != 200) {
+                        return body.asString().flatMap(err ->
+                            Mono.error(new RuntimeException("Purchase failed: " + response.status() + " - " + err))
+                        );
+                    }
+
+                    String serverTiming = response.responseHeaders().get("Server-Timing");
+                    String respKid = Optional.ofNullable(response.responseHeaders().get("X-Kid"))
+                        .orElseThrow(() -> new RuntimeException("Missing required X-Kid header in response"));
+                    String respRequestId = Optional.ofNullable(response.responseHeaders().get("X-Idempotency-Key"))
+                        .orElseThrow(() -> new RuntimeException("Missing required X-Idempotency-Key header in response"));
+
+                    return body.asByteArray().map(responseBody -> {
+                        return new PurchaseResponseData(data, responseBody, httpMs, serverTiming, respKid, respRequestId);
+                    });
+                });
+        })
+        .flatMap(responseData -> Mono.fromCallable(() -> {
+            // Decrypt response (CPU-bound)
+            EncryptData data = responseData.encryptData;
+
+            if (verbose) {
+                System.out.println("\n  📥 Received encrypted response (status: 200)");
+                System.out.println("     Response headers:");
+                System.out.println("       X-Kid: " + responseData.respKid);
+                System.out.println("       X-Idempotency-Key: " + responseData.respRequestId.substring(0, Math.min(30, responseData.respRequestId.length())) + "...");
+            }
+
+            // Parse response request ID to get timestamp and nonce for AAD reconstruction
+            String[] respParts = responseData.respRequestId.split("\\.");
+            if (respParts.length != 2) {
+                throw new RuntimeException("Invalid X-Idempotency-Key format in response");
+            }
+            String respTimestamp = respParts[0];
+            String respNonce = respParts[1];
+
+            // Reconstruct AAD from response headers
+            byte[] respAad = (respTimestamp + "|" + respNonce + "|" + responseData.respKid + "|" + session.clientId)
+                .getBytes(StandardCharsets.UTF_8);
+
+            byte[] respEncryptedBody = responseData.responseBody;
+
+            if (verbose) {
+                System.out.println("     Encrypted body length: " + respEncryptedBody.length + " bytes");
+                System.out.println("\n  🔓 Decrypting response...");
+            }
+
+            // OPTIMIZATION: Decrypt with reused Cipher instance (synchronized for thread safety)
+            byte[] respPlaintext = measureSync("aes-gcm-decrypt", data.cryptoOps, () -> {
+                // Extract IV (first 12 bytes) and ciphertext+tag (rest)
+                byte[] respIv = new byte[12];
+                System.arraycopy(respEncryptedBody, 0, respIv, 0, 12);
+                byte[] respCiphertextWithTag = new byte[respEncryptedBody.length - 12];
+                System.arraycopy(respEncryptedBody, 12, respCiphertextWithTag, 0, respCiphertextWithTag.length);
+
+                synchronized (session.decryptCipher) {
+                    GCMParameterSpec decGcmSpec = new GCMParameterSpec(128, respIv);
+                    session.decryptCipher.init(Cipher.DECRYPT_MODE, session.keySpec, decGcmSpec);
+                    session.decryptCipher.updateAAD(respAad);
+                    return session.decryptCipher.doFinal(respCiphertextWithTag);
+                }
+            });
+
+            if (verbose) {
+                JsonNode responseJson = mapper.readTree(respPlaintext);
+                System.out.println("  ✅ Decryption successful!\n");
+                System.out.println("  📋 Decrypted response:");
+                System.out.println("  ─────────────────────────────────────────");
+                System.out.println(mapper.writerWithDefaultPrettyPrinter().writeValueAsString(responseJson));
+                System.out.println("  ─────────────────────────────────────────");
+            }
+
+            return new EndpointMetrics(
+                "/transaction/purchase",
+                (System.nanoTime() - data.totalStart) / 1_000_000.0,
+                responseData.httpMs,
+                data.cryptoOps,
+                responseData.serverTiming
+            );
+        }).subscribeOn(Schedulers.parallel()));  // Run crypto on parallel scheduler
     }
 
     // ===== Metrics Display =====
@@ -479,27 +624,30 @@ public class SessionCryptoClient {
     }
 
     // ===== Benchmark Mode =====
-    static CompletableFuture<Void> runBenchmarkAsync(int iterations) {
-        return CompletableFuture.runAsync(() -> {
-            try {
-                int warmup = 5;
-                List<Double> initDurations = new ArrayList<>();
-                List<Double> purchaseDurations = new ArrayList<>();
-                List<Double> combinedDurations = new ArrayList<>();
+    static Mono<Void> runBenchmarkReactive(int iterations) {
+        return Mono.fromCallable(() -> {
+            int warmup = 5;
+            List<Double> initDurations = new ArrayList<>();
+            List<Double> purchaseDurations = new ArrayList<>();
+            List<Double> combinedDurations = new ArrayList<>();
 
-                System.out.println("\n================================================================================");
-                System.out.printf("  Throughput Benchmark (%d iterations, %d warmup)%n", iterations, warmup);
-                System.out.println("================================================================================\n");
+            System.out.println("\n================================================================================");
+            System.out.printf("  Throughput Benchmark (%d iterations, %d warmup)%n", iterations, warmup);
+            System.out.println("================================================================================\n");
 
-                for (int i = 0; i < iterations + warmup; i++) {
-                    long flowStart = System.nanoTime();
+            for (int i = 0; i < iterations + warmup; i++) {
+                long flowStart = System.nanoTime();
 
-                    InitResult initResult = initSessionAsync(false).join();
-                    EndpointMetrics purchaseMetrics = makePurchaseAsync(
-                        initResult.session(),
+                // Execute reactive chain and block for result
+                InitResult initResult = initSessionReactive(false).block();
+
+                // SECURITY: Use try-with-resources to ensure session key is wiped
+                try (SessionContext session = initResult.session()) {
+                    EndpointMetrics purchaseMetrics = makePurchaseReactive(
+                        session,
                         new PurchaseRequest("AEF", 5000),
                         false
-                    ).join();
+                    ).block();
 
                     double flowDuration = (System.nanoTime() - flowStart) / 1_000_000.0;
 
@@ -508,28 +656,28 @@ public class SessionCryptoClient {
                         purchaseDurations.add(purchaseMetrics.totalRoundTripMs);
                         combinedDurations.add(flowDuration);
                     }
-
-                    // Progress indicator
-                    if ((i + 1) % 10 == 0 || i == iterations + warmup - 1) {
-                        int progress = Math.min(i + 1 - warmup, iterations);
-                        System.out.printf("\r  Progress: %d/%d iterations completed", progress, iterations);
-                    }
                 }
 
-                System.out.println("\n");
-
-                // Calculate and display statistics
-                BenchmarkStats initStats = calculateStats(initDurations);
-                BenchmarkStats purchaseStats = calculateStats(purchaseDurations);
-                BenchmarkStats combinedStats = calculateStats(combinedDurations);
-
-                printStats("/session/init", initStats);
-                printStats("/transaction/purchase", purchaseStats);
-                printStats("Combined (init + purchase)", combinedStats);
-            } catch (Exception e) {
-                throw new RuntimeException(e);
+                // Progress indicator
+                if ((i + 1) % 10 == 0 || i == iterations + warmup - 1) {
+                    int progress = Math.min(i + 1 - warmup, iterations);
+                    System.out.printf("\r  Progress: %d/%d iterations completed", progress, iterations);
+                }
             }
-        });
+
+            System.out.println("\n");
+
+            // Calculate and display statistics
+            BenchmarkStats initStats = calculateStats(initDurations);
+            BenchmarkStats purchaseStats = calculateStats(purchaseDurations);
+            BenchmarkStats combinedStats = calculateStats(combinedDurations);
+
+            printStats("/session/init", initStats);
+            printStats("/transaction/purchase", purchaseStats);
+            printStats("Combined (init + purchase)", combinedStats);
+
+            return null;
+        }).subscribeOn(Schedulers.boundedElastic()).then();
     }
 
     static void printStats(String label, BenchmarkStats stats) {
@@ -644,6 +792,4 @@ public class SessionCryptoClient {
         @JsonProperty("schemeCode") String schemeCode,
         @JsonProperty("amount") int amount
     ) {}
-
-    record SessionContext(String sessionId, byte[] sessionKey, String kid, String clientId) {}
 }

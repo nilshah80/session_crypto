@@ -22,22 +22,74 @@ import java.util.function.Supplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import com.amazon.corretto.crypto.provider.AmazonCorrettoCryptoProvider;
+
 /**
  * Java Virtual Threads client with performance metrics and benchmark mode.
+ * Using Amazon Corretto Crypto Provider (ACCP) for native crypto performance.
+ * OPTIMIZED: Cipher reuse, buffer pooling, HTTP/2, pre-warming
  */
 public class SessionCryptoClient {
+    // Install ACCP as the highest priority security provider (with fallback)
+    static {
+        try {
+            AmazonCorrettoCryptoProvider.install();
+            System.out.println("✓ Amazon Corretto Crypto Provider (ACCP) installed");
+        } catch (Exception | NoClassDefFoundError e) {
+            System.out.println("⚠ Amazon Corretto Crypto Provider (ACCP) not available, using default JCA");
+            System.out.println("  Install ACCP for 10-50x better crypto performance");
+        }
+        prewarmCrypto();
+    }
+
     private static final String SERVER_URL = "http://localhost:3000";
-    private static final String CLIENT_ID = "JAVA_VT_CLIENT";
+    private static final String CLIENT_ID = "JAVA_VT_OPT_ACCP";
     private static final ObjectMapper mapper = new ObjectMapper();
 
     // Shared SecureRandom instance (thread-safe, avoid getInstanceStrong per request)
     private static final SecureRandom secureRandom = new SecureRandom();
 
-    // HttpClient using virtual threads with connection pooling
+    // OPTIMIZATION: ThreadLocal buffer pools to avoid allocations
+    private static final ThreadLocal<byte[]> IV_POOL = ThreadLocal.withInitial(() -> new byte[12]);
+    private static final ThreadLocal<byte[]> TEMP_BUFFER = ThreadLocal.withInitial(() -> new byte[4096]);
+
+    // OPTIMIZATION: HttpClient using HTTP/2 with optimized connection pooling
     private static final HttpClient httpClient = HttpClient.newBuilder()
         .executor(Executors.newVirtualThreadPerTaskExecutor())
-        .version(HttpClient.Version.HTTP_1_1)
+        .version(HttpClient.Version.HTTP_2)  // HTTP/2 for better performance
+        .connectTimeout(java.time.Duration.ofSeconds(10))
         .build();
+
+    // OPTIMIZATION: Pre-warm crypto providers to avoid first-call JIT overhead
+    private static void prewarmCrypto() {
+        try {
+            // Warm up ECDH
+            KeyPairGenerator keyGen = KeyPairGenerator.getInstance("EC");
+            keyGen.initialize(new ECGenParameterSpec("secp256r1"));
+            KeyPair kp = keyGen.generateKeyPair();
+
+            // Warm up HKDF
+            byte[] warmSecret = new byte[32];
+            secureRandom.nextBytes(warmSecret);
+            hkdf(warmSecret, "warmup".getBytes(), "warmup-info".getBytes(), 32);
+
+            // Warm up Cipher
+            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            byte[] key = new byte[32];
+            byte[] iv = new byte[12];
+            byte[] data = new byte[100];
+            secureRandom.nextBytes(key);
+            secureRandom.nextBytes(iv);
+            SecretKeySpec keySpec = new SecretKeySpec(key, "AES");
+            GCMParameterSpec gcmSpec = new GCMParameterSpec(128, iv);
+            cipher.init(Cipher.ENCRYPT_MODE, keySpec, gcmSpec);
+            cipher.doFinal(data);
+
+            System.out.println("✓ Crypto providers pre-warmed");
+        } catch (Exception e) {
+            System.err.println("⚠ Warning: Crypto pre-warming failed: " + e.getMessage());
+        }
+    }
 
     // ===== Metrics Types =====
     record CryptoTiming(String operation, double durationMs) {}
@@ -142,12 +194,15 @@ public class SessionCryptoClient {
                     } else {
                         // Single run with metrics
                         InitResult initResult = initSession(true);
-                        EndpointMetrics purchaseMetrics = makePurchase(
-                            initResult.session(),
-                            new PurchaseRequest("AEF", 5000),
-                            true
-                        );
-                        printMetricsSummary(initResult.metrics(), purchaseMetrics);
+                        // SECURITY: Use try-with-resources to ensure session key is wiped
+                        try (SessionContext session = initResult.session()) {
+                            EndpointMetrics purchaseMetrics = makePurchase(
+                                session,
+                                new PurchaseRequest("AEF", 5000),
+                                true
+                            );
+                            printMetricsSummary(initResult.metrics(), purchaseMetrics);
+                        }
                     }
 
                     System.out.println("═══════════════════════════════════════════════════════════════");
@@ -211,6 +266,7 @@ public class SessionCryptoClient {
             .header("Content-Type", "application/json")
             .header("X-Idempotency-Key", requestId)
             .header("X-ClientId", CLIENT_ID)
+            .timeout(java.time.Duration.ofSeconds(30))
             .POST(HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(requestBody)))
             .build();
 
@@ -316,26 +372,31 @@ public class SessionCryptoClient {
                 nonce.substring(0, 8) + "...|session:" + session.sessionId.substring(0, 8) + "...|" + session.clientId);
         }
 
-        // Encrypt with AES-256-GCM - returns IV || ciphertext || tag
+        // OPTIMIZATION: Encrypt with pre-created Cipher and pooled buffers
         byte[] encryptedBody = measureSync("aes-gcm-encrypt", cryptoOps, () -> {
+            // OPTIMIZATION: Use ThreadLocal buffer pool for IV
+            byte[] iv = IV_POOL.get();
             try {
-                byte[] iv = new byte[12];
                 secureRandom.nextBytes(iv);
 
-                Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
-                SecretKeySpec keySpec = new SecretKeySpec(session.sessionKey, "AES");
-                GCMParameterSpec gcmSpec = new GCMParameterSpec(128, iv);
-                cipher.init(Cipher.ENCRYPT_MODE, keySpec, gcmSpec);
-                cipher.updateAAD(aad);
-                byte[] ciphertextWithTag = cipher.doFinal(plaintext);
+                // OPTIMIZATION: Reuse Cipher instance from session
+                synchronized (session.encryptCipher) {  // Synchronize for thread safety
+                    GCMParameterSpec gcmSpec = new GCMParameterSpec(128, iv);
+                    session.encryptCipher.init(Cipher.ENCRYPT_MODE, session.keySpec, gcmSpec);
+                    session.encryptCipher.updateAAD(aad);
+                    byte[] ciphertextWithTag = session.encryptCipher.doFinal(plaintext);
 
-                // Concatenate: IV (12) || ciphertext || tag (already appended by Java)
-                byte[] result = new byte[12 + ciphertextWithTag.length];
-                System.arraycopy(iv, 0, result, 0, 12);
-                System.arraycopy(ciphertextWithTag, 0, result, 12, ciphertextWithTag.length);
-                return result;
+                    // Concatenate: IV (12) || ciphertext || tag (already appended by Java)
+                    byte[] result = new byte[12 + ciphertextWithTag.length];
+                    System.arraycopy(iv, 0, result, 0, 12);
+                    System.arraycopy(ciphertextWithTag, 0, result, 12, ciphertextWithTag.length);
+                    return result;
+                }
             } catch (Exception e) {
                 throw new RuntimeException(e);
+            } finally {
+                // SECURITY: Clear IV from ThreadLocal buffer
+                Arrays.fill(iv, (byte) 0);
             }
         });
 
@@ -350,6 +411,7 @@ public class SessionCryptoClient {
             .header("X-Kid", session.kid)
             .header("X-Idempotency-Key", requestId)
             .header("X-ClientId", session.clientId)
+            .timeout(java.time.Duration.ofSeconds(30))
             .POST(HttpRequest.BodyPublishers.ofByteArray(encryptedBody))
             .build();
 
@@ -402,12 +464,13 @@ public class SessionCryptoClient {
                 byte[] respCiphertextWithTag = new byte[respEncryptedBody.length - 12];
                 System.arraycopy(respEncryptedBody, 12, respCiphertextWithTag, 0, respCiphertextWithTag.length);
 
-                Cipher decCipher = Cipher.getInstance("AES/GCM/NoPadding");
-                SecretKeySpec decKeySpec = new SecretKeySpec(session.sessionKey, "AES");
-                GCMParameterSpec decGcmSpec = new GCMParameterSpec(128, respIv);
-                decCipher.init(Cipher.DECRYPT_MODE, decKeySpec, decGcmSpec);
-                decCipher.updateAAD(respAad);
-                return decCipher.doFinal(respCiphertextWithTag);
+                // OPTIMIZATION: Reuse Cipher instance from session
+                synchronized (session.decryptCipher) {  // Synchronize for thread safety
+                    GCMParameterSpec decGcmSpec = new GCMParameterSpec(128, respIv);
+                    session.decryptCipher.init(Cipher.DECRYPT_MODE, session.keySpec, decGcmSpec);
+                    session.decryptCipher.updateAAD(respAad);
+                    return session.decryptCipher.doFinal(respCiphertextWithTag);
+                }
             } catch (Exception e) {
                 throw new RuntimeException(e);
             }
@@ -473,18 +536,21 @@ public class SessionCryptoClient {
             long flowStart = System.nanoTime();
 
             InitResult initResult = initSession(false);
-            EndpointMetrics purchaseMetrics = makePurchase(
-                initResult.session(),
-                new PurchaseRequest("AEF", 5000),
-                false
-            );
+            // SECURITY: Use try-with-resources to ensure session key is wiped
+            try (SessionContext session = initResult.session()) {
+                EndpointMetrics purchaseMetrics = makePurchase(
+                    session,
+                    new PurchaseRequest("AEF", 5000),
+                    false
+                );
 
-            double flowDuration = (System.nanoTime() - flowStart) / 1_000_000.0;
+                double flowDuration = (System.nanoTime() - flowStart) / 1_000_000.0;
 
-            if (i >= warmup) {
-                initDurations.add(initResult.metrics().totalRoundTripMs);
-                purchaseDurations.add(purchaseMetrics.totalRoundTripMs);
-                combinedDurations.add(flowDuration);
+                if (i >= warmup) {
+                    initDurations.add(initResult.metrics().totalRoundTripMs);
+                    purchaseDurations.add(purchaseMetrics.totalRoundTripMs);
+                    combinedDurations.add(flowDuration);
+                }
             }
 
             // Progress indicator
@@ -619,5 +685,32 @@ public class SessionCryptoClient {
         @JsonProperty("amount") int amount
     ) {}
 
-    record SessionContext(String sessionId, byte[] sessionKey, String kid, String clientId) {}
+    // OPTIMIZATION: SessionContext now includes reusable Cipher instances
+    static class SessionContext implements AutoCloseable {
+        final String sessionId;
+        final byte[] sessionKey;
+        final String kid;
+        final String clientId;
+        final Cipher encryptCipher;
+        final Cipher decryptCipher;
+        final SecretKeySpec keySpec;
+
+        SessionContext(String sessionId, byte[] sessionKey, String kid, String clientId) throws Exception {
+            this.sessionId = sessionId;
+            this.sessionKey = sessionKey;
+            this.kid = kid;
+            this.clientId = clientId;
+            this.keySpec = new SecretKeySpec(sessionKey, "AES");
+
+            // OPTIMIZATION: Pre-create and cache Cipher instances
+            this.encryptCipher = Cipher.getInstance("AES/GCM/NoPadding");
+            this.decryptCipher = Cipher.getInstance("AES/GCM/NoPadding");
+        }
+
+        @Override
+        public void close() {
+            // SECURITY: Clear sensitive data
+            Arrays.fill(sessionKey, (byte) 0);
+        }
+    }
 }

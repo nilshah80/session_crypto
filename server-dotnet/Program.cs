@@ -1,3 +1,5 @@
+using System.Buffers;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
@@ -89,9 +91,9 @@ var connStringBuilder = new NpgsqlConnectionStringBuilder
     Username = pgUser,
     Password = pgPass,
     Database = pgDb,
-    // Connection pooling configuration
+    // Connection pooling configuration (optimized for standard workloads)
     MinPoolSize = 5,
-    MaxPoolSize = 100,
+    MaxPoolSize = 20,
     ConnectionIdleLifetime = 300,
     ConnectionPruningInterval = 10,
     // Timeouts
@@ -138,6 +140,12 @@ await using (var cmd = dataSource.CreateCommand(@"
     await cmd.ExecuteNonQueryAsync();
 }
 
+// Constants
+const int TimestampWindowMs = 5 * 60 * 1000;
+const int NonceTtlSec = 300;
+const string NoncePrefix = "nonce:";
+const string SessionPrefix = "sess:";
+
 // Graceful shutdown handling
 app.Lifetime.ApplicationStopping.Register(() =>
 {
@@ -145,12 +153,6 @@ app.Lifetime.ApplicationStopping.Register(() =>
     redis?.Close();
     dataSource?.Dispose();
 });
-
-// Constants
-const int TimestampWindowMs = 5 * 60 * 1000;
-const int NonceTtlSec = 300;
-const string NoncePrefix = "nonce:";
-const string SessionPrefix = "sess:";
 
 app.UseCors();
 
@@ -233,15 +235,15 @@ app.MapPost("/session/init", async (HttpContext context) =>
         byte[] clientPubBytes;
         try
         {
-            metrics.Measure("validate-pubkey", () =>
+            clientPubBytes = metrics.Measure("validate-pubkey", () =>
             {
-                clientPubBytes = Convert.FromBase64String(requestBody.ClientPublicKey);
-                if (clientPubBytes.Length != 65 || clientPubBytes[0] != 0x04)
+                var bytes = Convert.FromBase64String(requestBody.ClientPublicKey);
+                if (bytes.Length != 65 || bytes[0] != 0x04)
                 {
                     throw new Exception("Invalid key format");
                 }
+                return bytes;
             });
-            clientPubBytes = Convert.FromBase64String(requestBody.ClientPublicKey);
         }
         catch
         {
@@ -376,10 +378,25 @@ app.MapPost("/transaction/purchase", async (HttpContext context) =>
             aad = Encoding.UTF8.GetBytes($"{timestamp}|{nonce}|{kid}|{clientId}");
         });
 
-        // Read encrypted body
-        using var ms = new MemoryStream();
-        await context.Request.Body.CopyToAsync(ms);
-        var encryptedBody = ms.ToArray();
+        // Read encrypted body using ArrayPool
+        var buffer = ArrayPool<byte>.Shared.Rent(8192);
+        var encryptedBody = Array.Empty<byte>();
+        try
+        {
+            using var ms = new MemoryStream();
+            int bytesRead;
+            while ((bytesRead = await context.Request.Body.ReadAsync(buffer)) > 0)
+            {
+                ms.Write(buffer, 0, bytesRead);
+            }
+            encryptedBody = ms.ToArray();
+        }
+        finally
+        {
+            // SECURITY: Clear sensitive data before returning to pool
+            buffer.AsSpan().Clear();
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
 
         if (encryptedBody.Length < 28)
         {
@@ -498,19 +515,34 @@ static byte[] CreateSubjectPublicKeyInfo(byte[] uncompressedPoint)
 
 static byte[] AesGcmEncrypt(byte[] key, byte[] aad, byte[] plaintext)
 {
-    var iv = RandomNumberGenerator.GetBytes(12);
-    var tag = new byte[16];
-    var ciphertext = new byte[plaintext.Length];
+    // Use ArrayPool for temporary buffers
+    var iv = ArrayPool<byte>.Shared.Rent(12);
+    var tag = ArrayPool<byte>.Shared.Rent(16);
+    var ciphertext = ArrayPool<byte>.Shared.Rent(plaintext.Length);
 
-    using var aes = new AesGcm(key, 16);
-    aes.Encrypt(iv, plaintext, ciphertext, tag, aad);
+    try
+    {
+        RandomNumberGenerator.Fill(iv.AsSpan(0, 12));
 
-    // Return IV || ciphertext || tag
-    var result = new byte[iv.Length + ciphertext.Length + tag.Length];
-    Buffer.BlockCopy(iv, 0, result, 0, iv.Length);
-    Buffer.BlockCopy(ciphertext, 0, result, iv.Length, ciphertext.Length);
-    Buffer.BlockCopy(tag, 0, result, iv.Length + ciphertext.Length, tag.Length);
-    return result;
+        // Create new AesGcm instance per request (AesGcm is NOT thread-safe)
+        using var aes = new AesGcm(key, 16);
+        aes.Encrypt(iv.AsSpan(0, 12), plaintext, ciphertext.AsSpan(0, plaintext.Length), tag.AsSpan(0, 16), aad);
+
+        // Return IV || ciphertext || tag
+        var result = new byte[12 + plaintext.Length + 16];
+        Buffer.BlockCopy(iv, 0, result, 0, 12);
+        Buffer.BlockCopy(ciphertext, 0, result, 12, plaintext.Length);
+        Buffer.BlockCopy(tag, 0, result, 12 + plaintext.Length, 16);
+        return result;
+    }
+    finally
+    {
+        // SECURITY: Clear entire rented buffers before returning to pool
+        // Using clearArray: true ensures entire buffer is zeroed, not just used portion
+        ArrayPool<byte>.Shared.Return(iv, clearArray: true);
+        ArrayPool<byte>.Shared.Return(tag, clearArray: true);
+        ArrayPool<byte>.Shared.Return(ciphertext, clearArray: true);
+    }
 }
 
 static byte[] AesGcmDecrypt(byte[] key, byte[] aad, byte[] data)
@@ -523,6 +555,7 @@ static byte[] AesGcmDecrypt(byte[] key, byte[] aad, byte[] data)
     var tag = data[^16..];
     var plaintext = new byte[ciphertext.Length];
 
+    // Create new AesGcm instance per request (AesGcm is NOT thread-safe)
     using var aes = new AesGcm(key, 16);
     aes.Decrypt(iv, ciphertext, tag, plaintext, aad);
     return plaintext;
