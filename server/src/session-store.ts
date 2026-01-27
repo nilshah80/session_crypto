@@ -25,11 +25,18 @@ const MIGRATION_SQL = `
   CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
 `;
 
+// Configuration constants (with environment variable overrides)
+const PG_POOL_MAX = parseInt(process.env.PG_POOL_MAX || "25", 10);
+const PG_IDLE_TIMEOUT_MS = parseInt(process.env.PG_IDLE_TIMEOUT_MS || "60000", 10);
+const PG_CONNECTION_TIMEOUT_MS = parseInt(process.env.PG_CONNECTION_TIMEOUT_MS || "5000", 10);
+
 let redis: Redis | null = null;
 let pool: pg.Pool | null = null;
+let logger: any = null;
 
-export async function initSessionStore(redisClient: Redis): Promise<void> {
+export async function initSessionStore(redisClient: Redis, loggerInstance?: any): Promise<void> {
   redis = redisClient;
+  logger = loggerInstance;
 
   // Pool configuration for production
   pool = new Pool({
@@ -39,12 +46,29 @@ export async function initSessionStore(redisClient: Redis): Promise<void> {
     database: process.env.POSTGRES_DB || "session_crypto",
     port: parseInt(process.env.POSTGRES_PORT || "5432"),
     // Connection pool settings
-    max: 25,                      // Maximum connections
-    idleTimeoutMillis: 60000,     // Close idle connections after 1 minute
-    connectionTimeoutMillis: 5000, // Fail fast if can't connect in 5 seconds
+    max: PG_POOL_MAX,
+    idleTimeoutMillis: PG_IDLE_TIMEOUT_MS,
+    connectionTimeoutMillis: PG_CONNECTION_TIMEOUT_MS,
     // SSL configuration (set POSTGRES_SSL=true in production)
     ssl: process.env.POSTGRES_SSL === "true" ? { rejectUnauthorized: false } : undefined,
   });
+
+  // IMPORTANT: For PgBouncer transaction pooling mode (Azure PostgreSQL):
+  // - Application-level statement_timeout settings won't work
+  // - Session-level SET commands are RESET after each transaction
+  // - pool.on('connect') only fires for NEW physical connections, not pooled ones
+  //
+  // YOU MUST set statement_timeout at PostgreSQL database level:
+  //
+  //   For Azure PostgreSQL Flexible Server:
+  //   ALTER DATABASE session_crypto SET statement_timeout = '5s';
+  //
+  //   Or globally (server parameter):
+  //   Go to Azure Portal > PostgreSQL Server > Server parameters > statement_timeout
+  //
+  //   Or via SQL:
+  //   ALTER SYSTEM SET statement_timeout = '5s';
+  //   SELECT pg_reload_conf();
 
   // Ensure table exists using embedded SQL
   await pool.query(MIGRATION_SQL);
@@ -70,19 +94,26 @@ export async function storeSession(
   principal?: string,
   clientId?: string
 ): Promise<void> {
-  if (!redis || !pool) {
+  if (!pool) {
     throw new Error("Session store not initialized");
   }
 
   const expiresAt = Date.now() + ttlSec * 1000;
+
+  // Create a copy of the key buffer for encoding to avoid modifying the original
+  const keyCopy = Buffer.from(key);
+
   const sessionData = {
-    key: b64(key),
+    key: b64(keyCopy),
     type,
     expiresAt,
     ...(principal && { principal }),
     ...(clientId && { clientId }),
   };
   const value = JSON.stringify(sessionData);
+
+  // SECURITY: Zeroize the key copy after encoding
+  keyCopy.fill(0);
 
   // 1. Write to PostgreSQL (Source of Truth)
   await pool.query(
@@ -93,19 +124,35 @@ export async function storeSession(
     [sessionId, value, expiresAt]
   );
 
-  // 2. Write to Redis (Cache)
-  await redis.set(`${SESSION_PREFIX}${sessionId}`, value, "EX", ttlSec);
+  // 2. Write to Redis (Cache) - optional, skip if Redis is unavailable
+  if (redis && redis.status === "ready") {
+    try {
+      await redis.set(`${SESSION_PREFIX}${sessionId}`, value, "EX", ttlSec);
+    } catch (err) {
+      if (logger) {
+        logger.warn({ err, sessionId }, "Failed to cache session in Redis");
+      }
+    }
+  }
 }
 
 export async function getSession(sessionId: string): Promise<SessionData | null> {
-  if (!redis || !pool) {
+  if (!pool) {
     throw new Error("Session store not initialized");
   }
 
-  // 1. Try Redis
-  const cachedValue = await redis.get(`${SESSION_PREFIX}${sessionId}`);
-  if (cachedValue) {
-    return parseSession(cachedValue, sessionId);
+  // 1. Try Redis (if available)
+  if (redis && redis.status === "ready") {
+    try {
+      const cachedValue = await redis.get(`${SESSION_PREFIX}${sessionId}`);
+      if (cachedValue) {
+        return parseSession(cachedValue, sessionId);
+      }
+    } catch (err) {
+      if (logger) {
+        logger.warn({ err, sessionId }, "Redis read failed, falling back to PostgreSQL");
+      }
+    }
   }
 
   // 2. Fallback to PostgreSQL
@@ -123,11 +170,17 @@ export async function getSession(sessionId: string): Promise<SessionData | null>
   const dbValue = typeof rawData === "string" ? rawData : JSON.stringify(rawData);
   const parsed = await parseSession(dbValue, sessionId);
 
-  // Populate Redis if found and valid
-  if (parsed) {
+  // Populate Redis if found, valid, and Redis is available
+  if (parsed && redis && redis.status === "ready") {
     const ttl = Math.ceil((parsed.expiresAt - Date.now()) / 1000);
     if (ttl > 0) {
-      await redis.set(`${SESSION_PREFIX}${sessionId}`, dbValue, "EX", ttl);
+      try {
+        await redis.set(`${SESSION_PREFIX}${sessionId}`, dbValue, "EX", ttl);
+      } catch (err) {
+        if (logger) {
+          logger.warn({ err, sessionId }, "Failed to populate Redis cache");
+        }
+      }
     }
   }
 
@@ -135,17 +188,31 @@ export async function getSession(sessionId: string): Promise<SessionData | null>
 }
 
 export async function deleteSession(sessionId: string): Promise<boolean> {
-  if (!redis || !pool) {
+  if (!pool) {
     throw new Error("Session store not initialized");
   }
 
-  // Delete from both
-  const [redisRes, pgRes] = await Promise.all([
-    redis.del(`${SESSION_PREFIX}${sessionId}`),
-    pool.query("DELETE FROM sessions WHERE session_id = $1", [sessionId])
-  ]);
+  const promises: Promise<any>[] = [];
 
-  return redisRes > 0 || (pgRes.rowCount ?? 0) > 0;
+  // Delete from Redis if available
+  if (redis && redis.status === "ready") {
+    promises.push(
+      redis.del(`${SESSION_PREFIX}${sessionId}`).catch((err) => {
+        if (logger) {
+          logger.warn({ err, sessionId }, "Failed to delete session from Redis");
+        }
+        return 0;
+      })
+    );
+  }
+
+  // Delete from PostgreSQL
+  promises.push(pool.query("DELETE FROM sessions WHERE session_id = $1", [sessionId]));
+
+  const results = await Promise.all(promises);
+  const pgRes = promises.length === 2 ? results[1] : results[0];
+
+  return (pgRes.rowCount ?? 0) > 0;
 }
 
 async function parseSession(jsonStr: string, sessionId: string): Promise<SessionData | null> {
@@ -156,7 +223,9 @@ async function parseSession(jsonStr: string, sessionId: string): Promise<Session
     if (Date.now() > parsed.expiresAt) {
       // Async cleanup with proper await and error handling
       cleanupExpiredSession(sessionId).catch((err) => {
-        console.error(`Failed to cleanup expired session ${sessionId}:`, err);
+        if (logger) {
+          logger.error({ err, sessionId }, "Failed to cleanup expired session");
+        }
       });
       return null;
     }

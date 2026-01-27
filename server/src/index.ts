@@ -10,6 +10,7 @@ import {
   validateP256PublicKey,
   validateReplayProtection,
   initReplayProtection,
+  disposeReplayProtection,
   aesGcmDecrypt,
   aesGcmEncrypt,
   buildAad,
@@ -29,10 +30,54 @@ const fastify = Fastify({
   logger: true,
 });
 
+// Configuration constants (with environment variable overrides)
+const REDIS_COMMAND_TIMEOUT_MS = parseInt(process.env.REDIS_COMMAND_TIMEOUT_MS || "5000", 10);
+const REDIS_CONNECTION_TIMEOUT_MS = parseInt(process.env.REDIS_CONNECTION_TIMEOUT_MS || "10000", 10);
+const SESSION_TTL_MIN_SEC = parseInt(process.env.SESSION_TTL_MIN_SEC || "300", 10);  // 5 minutes
+const SESSION_TTL_MAX_SEC = parseInt(process.env.SESSION_TTL_MAX_SEC || "3600", 10); // 1 hour
+const SESSION_TTL_DEFAULT_SEC = parseInt(process.env.SESSION_TTL_DEFAULT_SEC || "1800", 10); // 30 minutes
+
+// Validate required environment variables
+function validateEnvironment(): void {
+  const required = [
+    "REDIS_HOST",
+    "POSTGRES_HOST",
+    "POSTGRES_USER",
+    "POSTGRES_PASSWORD",
+    "POSTGRES_DB",
+  ];
+
+  const missing = required.filter((key) => !process.env[key]);
+
+  if (missing.length > 0) {
+    throw new Error(
+      `Missing required environment variables: ${missing.join(", ")}\n` +
+        `Please check your .env file or environment configuration.`
+    );
+  }
+
+  // Validate port is a valid number
+  const port = parseInt(process.env.PORT || "3000", 10);
+  if (isNaN(port) || port < 1 || port > 65535) {
+    throw new Error(`Invalid PORT: ${process.env.PORT}`);
+  }
+
+  const redisPort = parseInt(process.env.REDIS_PORT || "6379", 10);
+  if (isNaN(redisPort) || redisPort < 1 || redisPort > 65535) {
+    throw new Error(`Invalid REDIS_PORT: ${process.env.REDIS_PORT}`);
+  }
+
+  const postgresPort = parseInt(process.env.POSTGRES_PORT || "5432", 10);
+  if (isNaN(postgresPort) || postgresPort < 1 || postgresPort > 65535) {
+    throw new Error(`Invalid POSTGRES_PORT: ${process.env.POSTGRES_PORT}`);
+  }
+}
+
 // Initialize Redis connection
 const redis = new Redis({
   host: process.env.REDIS_HOST || "localhost",
   port: parseInt(process.env.REDIS_PORT || "6379", 10),
+  commandTimeout: REDIS_COMMAND_TIMEOUT_MS,
   retryStrategy: (times) => {
     const delay = Math.min(times * 50, 2000);
     return delay;
@@ -40,16 +85,16 @@ const redis = new Redis({
 });
 
 redis.on("connect", () => {
-  console.log("Connected to Redis");
+  fastify.log.info("Connected to Redis");
 });
 
 redis.on("error", (err) => {
-  console.error("Redis connection error:", err);
+  fastify.log.error({ err }, "Redis connection error");
 });
 
 // Initialize stores with Redis
 // Session store initialized in start()
-initReplayProtection(redis);
+initReplayProtection(redis, fastify.log);
 
 // Enable CORS for browser clients (must be registered before routes)
 await fastify.register(cors, {
@@ -172,8 +217,13 @@ fastify.post<{
   // Generate session ID with 128-bit entropy
   const sessionId = generateSessionId("S");
 
-  // Cap TTL between 5 minutes and 1 hour
-  const allowedTtl = Math.min(Math.max(ttlSec ?? 1800, 300), 3600);
+  // Validate TTL
+  if (ttlSec !== undefined && (ttlSec < 0 || !Number.isInteger(ttlSec))) {
+    return reply.status(400).send({ error: "CRYPTO_ERROR" });
+  }
+
+  // Cap TTL between configured min and max
+  const allowedTtl = Math.min(Math.max(ttlSec ?? SESSION_TTL_DEFAULT_SEC, SESSION_TTL_MIN_SEC), SESSION_TTL_MAX_SEC);
 
   // Derive session key using HKDF
   // Info includes clientId for domain separation
@@ -183,10 +233,16 @@ fastify.post<{
     hkdf32(sharedSecret, salt, info)
   );
 
+  // SECURITY: Zeroize shared secret after deriving session key
+  sharedSecret.fill(0);
+
   // Store session in Redis
   await request.metrics!.measureAsync("redis-store", () =>
     storeSession(sessionId, sessionKey, "AUTH", allowedTtl)
   );
+
+  // SECURITY: Zeroize session key after storing
+  sessionKey.fill(0);
 
   request.log.info({ sessionId, ttl: allowedTtl }, "Session created");
 
@@ -316,6 +372,9 @@ fastify.post("/transaction/purchase", async (request, reply) => {
     aesGcmEncrypt(session.key, responseAad, responsePlaintext)
   );
 
+  // SECURITY: Zeroize session key after use (each getSession creates a new buffer)
+  session.key.fill(0);
+
   // Set response headers
   reply.header("X-Kid", kid);
   reply.header("X-Idempotency-Key", responseIdempotencyKey);
@@ -353,7 +412,8 @@ fastify.get("/health", async () => {
 
 // Graceful shutdown
 const shutdown = async () => {
-  console.log("Shutting down...");
+  fastify.log.info("Shutting down...");
+  disposeReplayProtection();
   await redis.quit();
   await closeSessionStore();
   await fastify.close();
@@ -366,22 +426,31 @@ process.on("SIGINT", shutdown);
 // Start server
 const start = async () => {
   try {
-    // Wait for Redis to be ready
-    await new Promise<void>((resolve, reject) => {
-      if (redis.status === "ready") {
-        resolve();
-        return;
-      }
-      redis.once("ready", resolve);
-      redis.once("error", reject);
-      setTimeout(() => reject(new Error("Redis connection timeout")), 10000);
-    });
+    // Validate environment variables first
+    validateEnvironment();
+
+    // Try to wait for Redis to be ready (optional - server can run without Redis)
+    try {
+      await new Promise<void>((resolve, reject) => {
+        if (redis.status === "ready") {
+          resolve();
+          return;
+        }
+        redis.once("ready", resolve);
+        redis.once("error", reject);
+        setTimeout(() => reject(new Error("Redis connection timeout")), REDIS_CONNECTION_TIMEOUT_MS);
+      });
+      fastify.log.info("Redis connected - cache enabled");
+    } catch (redisErr) {
+      fastify.log.warn({ err: redisErr }, "Redis unavailable - running without cache (PostgreSQL only)");
+    }
 
     // Initialize session store (connects to Postgres)
-    await initSessionStore(redis);
+    await initSessionStore(redis, fastify.log);
 
-    await fastify.listen({ port: 3000, host: "0.0.0.0" });
-    console.log("Server listening on http://localhost:3000");
+    const PORT = parseInt(process.env.PORT || "3000", 10);
+    await fastify.listen({ port: PORT, host: "0.0.0.0" });
+    fastify.log.info(`Server listening on http://localhost:${PORT}`);
   } catch (err) {
     fastify.log.error(err);
     process.exit(1);

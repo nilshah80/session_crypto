@@ -4,6 +4,10 @@ import crypto from "crypto";
 export const b64 = (buf: Buffer): string => buf.toString("base64");
 export const unb64 = (s: string): Buffer => Buffer.from(s, "base64");
 
+// AES-256-GCM constants
+const IV_SIZE = 12;  // 96-bit IV for GCM mode
+const TAG_SIZE = 16; // 128-bit authentication tag
+
 // OPTIMIZATION: Buffer pool for IV reuse
 // NOTE: This pool is NOT thread-safe. It's safe for single-threaded Node.js event loop,
 // but would require synchronization (e.g., locks or per-thread pools) if crypto operations
@@ -14,7 +18,7 @@ const ivPool: Buffer[] = [];
 const IV_POOL_MAX_SIZE = 100;
 
 function getIVBuffer(): Buffer {
-  return ivPool.pop() || Buffer.allocUnsafe(12);
+  return ivPool.pop() || Buffer.allocUnsafe(IV_SIZE);
 }
 
 function returnIVBuffer(buf: Buffer): void {
@@ -57,20 +61,20 @@ export function aesGcmEncrypt(
     cipher.setAAD(aad);
 
     // OPTIMIZATION: Pre-allocate result buffer
-    const result = Buffer.allocUnsafe(12 + plaintext.length + 16);
+    const result = Buffer.allocUnsafe(IV_SIZE + plaintext.length + TAG_SIZE);
 
     // Copy IV
-    iv.copy(result, 0, 0, 12);
+    iv.copy(result, 0, 0, IV_SIZE);
 
     // Encrypt and copy ciphertext
     const updateResult = cipher.update(plaintext);
-    updateResult.copy(result, 12);
+    updateResult.copy(result, IV_SIZE);
     const finalResult = cipher.final();
-    finalResult.copy(result, 12 + updateResult.length);
+    finalResult.copy(result, IV_SIZE + updateResult.length);
 
     // Copy auth tag
     const tag = cipher.getAuthTag();
-    tag.copy(result, result.length - 16);
+    tag.copy(result, result.length - TAG_SIZE);
 
     return result;
   } finally {
@@ -85,9 +89,9 @@ export function aesGcmDecrypt(
   aad: Buffer,
   data: Buffer
 ): Buffer {
-  const iv = data.subarray(0, 12);
-  const tag = data.subarray(-16);
-  const ciphertext = data.subarray(12, -16);
+  const iv = data.subarray(0, IV_SIZE);
+  const tag = data.subarray(-TAG_SIZE);
+  const ciphertext = data.subarray(IV_SIZE, -TAG_SIZE);
 
   const decipher = crypto.createDecipheriv("aes-256-gcm", key32, iv);
   decipher.setAAD(aad);

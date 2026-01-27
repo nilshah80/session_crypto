@@ -10,7 +10,8 @@ import {
   buildAad,
 } from "./crypto-helpers.js";
 
-const SERVER_URL = "http://localhost:3000";
+const SERVER_URL = process.env.SERVER_URL || "http://localhost:3000";
+const CLIENT_REQUEST_TIMEOUT_MS = parseInt(process.env.CLIENT_REQUEST_TIMEOUT_MS || "5000", 10);
 
 // ===== Metrics Types =====
 interface CryptoTiming {
@@ -141,6 +142,7 @@ async function initSession(
   const httpStart = performance.now();
   const response = await fetch(`${SERVER_URL}/session/init`, {
     method: "POST",
+    signal: AbortSignal.timeout(CLIENT_REQUEST_TIMEOUT_MS),
     headers: {
       "Content-Type": "application/json",
       "X-Idempotency-Key": requestId,
@@ -192,6 +194,9 @@ async function initSession(
   const sessionKey = measureSync("hkdf", cryptoOps, () =>
     hkdf32(sharedSecret, salt, info)
   );
+
+  // SECURITY: Zeroize shared secret after deriving session key
+  sharedSecret.fill(0);
 
   if (verbose) {
     console.log("  🔑 Derived session key using HKDF-SHA256");
@@ -277,6 +282,7 @@ async function makePurchase(
   const httpStart = performance.now();
   const response = await fetch(`${SERVER_URL}/transaction/purchase`, {
     method: "POST",
+    signal: AbortSignal.timeout(CLIENT_REQUEST_TIMEOUT_MS),
     headers: {
       "Content-Type": "application/octet-stream",
       "X-Kid": session.kid,
@@ -355,6 +361,12 @@ async function makePurchase(
   };
 }
 
+// ===== Session Cleanup =====
+function cleanupSession(session: SessionContext): void {
+  // SECURITY: Zeroize session key from memory
+  session.sessionKey.fill(0);
+}
+
 // ===== Metrics Display =====
 function printMetricsSummary(
   initMetrics: EndpointMetrics,
@@ -418,6 +430,9 @@ async function runBenchmark(iterations: number): Promise<void> {
     );
 
     const flowDuration = performance.now() - flowStart;
+
+    // SECURITY: Cleanup session key after use
+    cleanupSession(session);
 
     if (i >= warmup) {
       initDurations.push(initMetrics.totalRoundTripMs);
@@ -490,6 +505,9 @@ async function main() {
         schemeCode: "AEF",
         amount: 5000,
       });
+
+      // SECURITY: Cleanup session key after use
+      cleanupSession(session);
 
       // Print metrics summary
       printMetricsSummary(initMetrics, purchaseMetrics);

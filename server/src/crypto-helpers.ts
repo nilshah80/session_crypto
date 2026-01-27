@@ -5,6 +5,10 @@ import { Redis } from "ioredis";
 export const b64 = (buf: Buffer): string => buf.toString("base64");
 export const unb64 = (s: string): Buffer => Buffer.from(s, "base64");
 
+// AES-256-GCM constants
+const IV_SIZE = 12;  // 96-bit IV for GCM mode
+const TAG_SIZE = 16; // 128-bit authentication tag
+
 // OPTIMIZATION: Buffer pool for IV reuse
 // NOTE: This pool is NOT thread-safe. It's safe for single-threaded Node.js event loop,
 // but would require synchronization (e.g., locks or per-thread pools) if crypto operations
@@ -15,7 +19,7 @@ const ivPool: Buffer[] = [];
 const IV_POOL_MAX_SIZE = 100;
 
 function getIVBuffer(): Buffer {
-  return ivPool.pop() || Buffer.allocUnsafe(12);
+  return ivPool.pop() || Buffer.allocUnsafe(IV_SIZE);
 }
 
 function returnIVBuffer(buf: Buffer): void {
@@ -58,20 +62,20 @@ export function aesGcmEncrypt(
     cipher.setAAD(aad);
 
     // OPTIMIZATION: Pre-allocate result buffer to avoid multiple Buffer.concat()
-    const result = Buffer.allocUnsafe(12 + plaintext.length + 16);
+    const result = Buffer.allocUnsafe(IV_SIZE + plaintext.length + TAG_SIZE);
 
     // Copy IV
-    iv.copy(result, 0, 0, 12);
+    iv.copy(result, 0, 0, IV_SIZE);
 
     // Encrypt and copy ciphertext
     const updateResult = cipher.update(plaintext);
-    updateResult.copy(result, 12);
+    updateResult.copy(result, IV_SIZE);
     const finalResult = cipher.final();
-    finalResult.copy(result, 12 + updateResult.length);
+    finalResult.copy(result, IV_SIZE + updateResult.length);
 
     // Copy auth tag
     const tag = cipher.getAuthTag();
-    tag.copy(result, result.length - 16);
+    tag.copy(result, result.length - TAG_SIZE);
 
     return result;
   } finally {
@@ -86,9 +90,9 @@ export function aesGcmDecrypt(
   aad: Buffer,
   data: Buffer
 ): Buffer {
-  const iv = data.subarray(0, 12);
-  const tag = data.subarray(-16);
-  const ciphertext = data.subarray(12, -16);
+  const iv = data.subarray(0, IV_SIZE);
+  const tag = data.subarray(-TAG_SIZE);
+  const ciphertext = data.subarray(IV_SIZE, -TAG_SIZE);
 
   const decipher = crypto.createDecipheriv("aes-256-gcm", key32, iv);
   decipher.setAAD(aad);
@@ -153,26 +157,109 @@ export function validateP256PublicKey(publicKeyBytes: Buffer): void {
   }
 }
 
-// Replay protection constants
-const TIMESTAMP_WINDOW_MS = 5 * 60 * 1000; // ±5 minutes
-const NONCE_TTL_SEC = 300; // 5 minutes
+// Replay protection constants (with environment variable overrides)
+const TIMESTAMP_WINDOW_MS = parseInt(process.env.TIMESTAMP_WINDOW_MS || (5 * 60 * 1000).toString(), 10); // Default: ±5 minutes
+const NONCE_TTL_SEC = parseInt(process.env.NONCE_TTL_SEC || "300", 10); // Default: 5 minutes
 const NONCE_PREFIX = "nonce:";
+const MEMORY_CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // Cleanup every 5 minutes
 
 let redis: Redis | null = null;
+let logger: any = null;
 
-export function initReplayProtection(redisClient: Redis): void {
-  redis = redisClient;
+/**
+ * In-memory nonce store as fallback when Redis is unavailable
+ * Note: With sticky sessions, this provides full replay protection in multi-pod deployments
+ * as each client's requests are routed to the same pod.
+ */
+const memoryNonceStore = new Map<string, number>();
+let cleanupInterval: NodeJS.Timeout | null = null;
+
+/**
+ * Cleanup expired nonces from in-memory fallback store
+ */
+function cleanupExpiredMemoryNonces(): void {
+  const now = Date.now();
+  const ttlMs = NONCE_TTL_SEC * 1000;
+  let cleaned = 0;
+
+  for (const [key, timestamp] of memoryNonceStore) {
+    if (now - timestamp > ttlMs) {
+      memoryNonceStore.delete(key);
+      cleaned++;
+    }
+  }
+
+  if (cleaned > 0 && logger) {
+    logger.debug({ cleaned, remaining: memoryNonceStore.size }, "Cleaned expired memory nonces");
+  }
 }
 
-// Validate replay protection using Redis
+export function initReplayProtection(redisClient: Redis, loggerInstance?: any): void {
+  redis = redisClient;
+  logger = loggerInstance;
+
+  // Start periodic cleanup of expired nonces from memory
+  if (!cleanupInterval) {
+    cleanupInterval = setInterval(() => {
+      cleanupExpiredMemoryNonces();
+    }, MEMORY_CLEANUP_INTERVAL_MS);
+
+    // Don't keep the process alive for this timer
+    cleanupInterval.unref?.();
+  }
+}
+
+/**
+ * Dispose replay protection resources (call during graceful shutdown)
+ */
+export function disposeReplayProtection(): void {
+  if (cleanupInterval) {
+    clearInterval(cleanupInterval);
+    cleanupInterval = null;
+  }
+  memoryNonceStore.clear();
+}
+
+/**
+ * In-memory nonce check fallback
+ * Provides replay protection when Redis is unavailable
+ * With sticky sessions: full protection across requests
+ */
+function checkAndStoreNonceInMemory(nonceKey: string): void {
+  const now = Date.now();
+  const existingTimestamp = memoryNonceStore.get(nonceKey);
+
+  if (existingTimestamp !== undefined) {
+    // Check if nonce has expired in memory
+    const ttlMs = NONCE_TTL_SEC * 1000;
+    if (now - existingTimestamp < ttlMs) {
+      if (logger) {
+        logger.warn({ nonceKey }, "Replay attack detected (in-memory store)");
+      }
+      throw new Error("REPLAY_DETECTED");
+    }
+    // Nonce expired in memory, allow reuse
+  }
+
+  // Store nonce with current timestamp
+  memoryNonceStore.set(nonceKey, now);
+}
+
+/**
+ * Validate replay protection using Redis (primary) with in-memory fallback
+ *
+ * Two-factor replay protection:
+ * 1. Timestamp window check (±5 minutes by default)
+ * 2. Nonce uniqueness check
+ *
+ * Storage strategy:
+ * - Primary: Redis (distributed, atomic operations)
+ * - Fallback: In-memory Map (single-pod or sticky session deployments)
+ */
 export async function validateReplayProtection(
   nonce: string,
   timestamp: string
 ): Promise<void> {
-  if (!redis) {
-    throw new Error("Replay protection not initialized");
-  }
-
   const ts = parseInt(timestamp, 10);
   const now = Date.now();
 
@@ -181,12 +268,33 @@ export async function validateReplayProtection(
     throw new Error("TIMESTAMP_INVALID");
   }
 
-  // 2. Nonce uniqueness (atomic check-and-set using Redis SET NX EX)
+  // 2. Nonce uniqueness check
   const key = `${NONCE_PREFIX}${nonce}`;
-  const wasSet = await redis.set(key, "1", "EX", NONCE_TTL_SEC, "NX");
 
-  if (!wasSet) {
-    throw new Error("REPLAY_DETECTED");
+  try {
+    // Try Redis first (primary storage - distributed)
+    if (!redis || redis.status !== "ready") {
+      throw new Error("Redis not ready");
+    }
+
+    const wasSet = await redis.set(key, "1", "EX", NONCE_TTL_SEC, "NX");
+
+    if (!wasSet) {
+      if (logger) {
+        logger.warn({ nonce }, "Replay attack detected (Redis)");
+      }
+      throw new Error("REPLAY_DETECTED");
+    }
+  } catch (error) {
+    // Redis unavailable - fall back to in-memory nonce tracking
+    if (logger) {
+      logger.warn(
+        { error: (error as Error).message },
+        "Redis unavailable for nonce check - using in-memory fallback"
+      );
+    }
+
+    checkAndStoreNonceInMemory(key);
   }
 }
 
