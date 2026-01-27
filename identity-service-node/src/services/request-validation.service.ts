@@ -1,0 +1,123 @@
+import { cacheService } from './cache.service';
+import { config } from '../config';
+import { CRYPTO } from '../constants';
+import log from '../utils/logger';
+
+/**
+ * RequestValidationService - Generic replay protection service
+ * Reusable across all endpoints (both authenticated and public)
+ *
+ * Based on session-crypto/server/src/crypto-helpers.ts (validateReplayProtection)
+ */
+
+const NONCE_PREFIX = 'nonce:';
+
+export class RequestValidationService {
+  private readonly timestampWindowMs: number;
+  private readonly nonceTtlSec: number;
+
+  constructor() {
+    this.timestampWindowMs = config.REPLAY_TIMESTAMP_WINDOW_SEC * 1000;
+    this.nonceTtlSec = config.REPLAY_NONCE_TTL_SEC;
+  }
+
+  /**
+   * Validate timestamp and nonce for replay protection
+   *
+   * Two-factor replay protection:
+   * 1. Timestamp window check (±5 minutes by default)
+   * 2. Nonce uniqueness check
+   *
+   * @param timestamp Timestamp string (milliseconds since epoch)
+   * @param nonce Unique nonce string (min 16 characters)
+   * @throws Error if timestamp is invalid or nonce has been used
+   */
+  async validateTimestampAndNonce(timestamp: string, nonce: string): Promise<void> {
+    // 1. Validate nonce length
+    if (!nonce || nonce.length < CRYPTO.MIN_NONCE_LENGTH) {
+      log.warn('RequestValidationService', 'Nonce too short', {
+        nonceLength: nonce?.length || 0,
+      });
+      throw new Error('NONCE_INVALID');
+    }
+
+    // 2. Timestamp window check
+    const ts = parseInt(timestamp, 10);
+    const now = Date.now();
+
+    if (isNaN(ts)) {
+      log.warn('RequestValidationService', 'Invalid timestamp format', { timestamp });
+      throw new Error('TIMESTAMP_INVALID');
+    }
+
+    if (Math.abs(now - ts) > this.timestampWindowMs) {
+      log.warn('RequestValidationService', 'Timestamp outside window', {
+        timestamp: ts,
+        now,
+        diff: now - ts,
+        windowMs: this.timestampWindowMs,
+      });
+      throw new Error('TIMESTAMP_INVALID');
+    }
+
+    // 3. Nonce uniqueness check (CRITICAL for replay protection)
+    const nonceKey = `${NONCE_PREFIX}${nonce}`;
+
+    try {
+      // Use STRICT mode - throws if Redis unavailable
+      const exists = await cacheService.existsStrict(nonceKey);
+
+      if (exists) {
+        log.warn('RequestValidationService', 'Replay attack detected', {
+          nonce,
+          timestamp: ts,
+        });
+        throw new Error('REPLAY_DETECTED');
+      }
+
+      // Store nonce with TTL (STRICT mode - throws if Redis unavailable)
+      await cacheService.setStrict(nonceKey, true, this.nonceTtlSec);
+
+      log.debug('RequestValidationService', 'Request validated', {
+        timestamp: ts,
+        nonceTtl: this.nonceTtlSec,
+      });
+    } catch (error) {
+      // Re-throw REPLAY_DETECTED - don't mask it
+      if ((error as Error).message === 'REPLAY_DETECTED') {
+        throw error;
+      }
+
+      // Redis unavailable - fail closed for security
+      log.error(
+        'RequestValidationService',
+        'Redis unavailable for replay protection',
+        error as Error
+      );
+      throw new Error('SERVICE_UNAVAILABLE');
+    }
+  }
+
+  /**
+   * Parse idempotency key header format: timestamp.nonce
+   * @param idempotencyKey Header value
+   * @returns Parsed timestamp and nonce
+   * @throws Error if format is invalid
+   */
+  parseIdempotencyKey(idempotencyKey: string): { timestamp: string; nonce: string } {
+    const parts = idempotencyKey.split('.');
+    if (parts.length !== 2) {
+      throw new Error('INVALID_IDEMPOTENCY_KEY_FORMAT');
+    }
+
+    const [timestamp, nonce] = parts;
+    if (!timestamp || !nonce) {
+      throw new Error('INVALID_IDEMPOTENCY_KEY_FORMAT');
+    }
+
+    return { timestamp, nonce };
+  }
+}
+
+// Export singleton instance
+export const requestValidationService = new RequestValidationService();

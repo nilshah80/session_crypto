@@ -1,0 +1,44 @@
+export interface Config {
+  // Server
+  HOST: string;
+  NODE_ENV: string;
+  PORT: number;
+  LOG_LEVEL: string;
+
+  // Database
+  DATABASE_HOST: string;
+  DATABASE_PORT: number;
+  DATABASE_NAME: string;
+  DATABASE_USER: string;
+  DATABASE_PASSWORD: string;
+  DATABASE_POOL_MIN: number;
+  DATABASE_POOL_MAX: number;
+  DATABASE_IDLE_TIMEOUT_MS: number;
+  DATABASE_CONNECTION_TIMEOUT_MS: number;
+  DATABASE_STATEMENT_TIMEOUT_MS: number;
+  DATABASE_QUERY_TIMEOUT_MS: number;
+
+  // Redis
+  REDIS_URL: string;
+  REDIS_PASSWORD?: string;
+  REDIS_MAX_RECONNECT_ATTEMPTS: number;
+  REDIS_RECONNECT_BASE_DELAY_MS: number;
+  REDIS_RECONNECT_MAX_DELAY_MS: number;
+
+  // Session Configuration
+  SESSION_TTL_MIN_SEC: number;
+  SESSION_TTL_MAX_SEC: number;
+  SESSION_TTL_DEFAULT_SEC: number;
+
+  // Replay Protection Configuration
+  REPLAY_TIMESTAMP_WINDOW_SEC: number;
+  REPLAY_NONCE_TTL_SEC: number;
+
+  // Cache Configuration
+  CACHE_LRU_MAX_TTL_SECONDS: number;
+
+  // HTTP Server Timeouts
+  CONNECTION_TIMEOUT_MS: number;
+  REQUEST_TIMEOUT_MS: number;
+  BODY_LIMIT_BYTES: number;
+}
