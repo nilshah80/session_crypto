@@ -509,3 +509,40 @@ SELECT session_id, expires_at FROM sessions;
 # View session data
 SELECT * FROM sessions WHERE session_id = 'S-<sessionId>';
 ```
+
+## Negative Tests
+
+Run the Node negative test suite:
+
+```bash
+cd client/node
+npm run test:negative
+```
+
+### Redis Down Fallback Test
+
+Start the server with Redis unavailable, then run tests with the Redis-down expectation:
+
+```bash
+# Terminal 1: start server with bad Redis port
+cd server
+REDIS_PORT=6390 npm run dev
+
+# Terminal 2: run tests
+cd client/node
+EXPECT_REDIS_DOWN=1 npm run test:negative
+```
+
+### Memory Nonce Capacity Test
+
+Run the capacity-only test with lowered memory limits (Redis must be down so the in-memory store is used):
+
+```bash
+# Terminal 1: start server with Redis down and low memory limits
+cd server
+REDIS_PORT=6390 MEMORY_NONCE_MAX_SIZE=1000 MEMORY_NONCE_CLEANUP_THRESHOLD=900 NONCE_TTL_SEC=600 npm run dev
+
+# Terminal 2: run capacity-only test
+cd client/node
+RUN_CAPACITY_ONLY=1 EXPECT_CAPACITY_EXCEEDED=1 CAPACITY_TEST_ATTEMPTS=1100 npm run test:negative
+```

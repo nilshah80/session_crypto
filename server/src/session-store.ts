@@ -15,6 +15,9 @@ export interface SessionData {
 // Redis key prefix for sessions
 const SESSION_PREFIX = "sess:";
 
+// Session ID format: S-[32 hex chars] or A-[32 hex chars] (128-bit entropy)
+const SESSION_ID_REGEX = /^[SA]-[a-f0-9]{32}$/;
+
 // Embedded migration SQL (no file dependency)
 const MIGRATION_SQL = `
   CREATE TABLE IF NOT EXISTS sessions (
@@ -25,10 +28,30 @@ const MIGRATION_SQL = `
   CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
 `;
 
-// Configuration constants (with environment variable overrides)
-const PG_POOL_MAX = parseInt(process.env.PG_POOL_MAX || "25", 10);
-const PG_IDLE_TIMEOUT_MS = parseInt(process.env.PG_IDLE_TIMEOUT_MS || "60000", 10);
-const PG_CONNECTION_TIMEOUT_MS = parseInt(process.env.PG_CONNECTION_TIMEOUT_MS || "5000", 10);
+/**
+ * Parse integer environment variable with validation
+ */
+function parseIntEnv(name: string, defaultValue: number, min?: number, max?: number): number {
+  const raw = process.env[name];
+  if (!raw) return defaultValue;
+
+  const parsed = parseInt(raw, 10);
+  if (isNaN(parsed)) {
+    throw new Error(`Invalid ${name}: "${raw}" is not a valid integer`);
+  }
+  if (min !== undefined && parsed < min) {
+    throw new Error(`Invalid ${name}: ${parsed} is below minimum ${min}`);
+  }
+  if (max !== undefined && parsed > max) {
+    throw new Error(`Invalid ${name}: ${parsed} exceeds maximum ${max}`);
+  }
+  return parsed;
+}
+
+// Configuration constants (with environment variable overrides and validation)
+const PG_POOL_MAX = parseIntEnv("PG_POOL_MAX", 25, 1, 100);
+const PG_IDLE_TIMEOUT_MS = parseIntEnv("PG_IDLE_TIMEOUT_MS", 60000, 1000, 600000);
+const PG_CONNECTION_TIMEOUT_MS = parseIntEnv("PG_CONNECTION_TIMEOUT_MS", 5000, 100, 60000);
 
 let redis: Redis | null = null;
 let pool: pg.Pool | null = null;
@@ -44,7 +67,7 @@ export async function initSessionStore(redisClient: Redis, loggerInstance?: any)
     password: process.env.POSTGRES_PASSWORD || "postgres",
     host: process.env.POSTGRES_HOST || "localhost",
     database: process.env.POSTGRES_DB || "session_crypto",
-    port: parseInt(process.env.POSTGRES_PORT || "5432"),
+    port: parseIntEnv("POSTGRES_PORT", 5432, 1, 65535),
     // Connection pool settings
     max: PG_POOL_MAX,
     idleTimeoutMillis: PG_IDLE_TIMEOUT_MS,
@@ -141,6 +164,11 @@ export async function getSession(sessionId: string): Promise<SessionData | null>
     throw new Error("Session store not initialized");
   }
 
+  // Validate session ID format to prevent malformed lookups
+  if (!SESSION_ID_REGEX.test(sessionId)) {
+    return null;
+  }
+
   // 1. Try Redis (if available)
   if (redis && redis.status === "ready") {
     try {
@@ -190,6 +218,11 @@ export async function getSession(sessionId: string): Promise<SessionData | null>
 export async function deleteSession(sessionId: string): Promise<boolean> {
   if (!pool) {
     throw new Error("Session store not initialized");
+  }
+
+  // Validate session ID format
+  if (!SESSION_ID_REGEX.test(sessionId)) {
+    return false;
   }
 
   const promises: Promise<any>[] = [];
@@ -245,8 +278,14 @@ async function parseSession(jsonStr: string, sessionId: string): Promise<Session
 async function cleanupExpiredSession(sessionId: string): Promise<void> {
   const promises: Promise<unknown>[] = [];
 
-  if (redis) {
-    promises.push(redis.del(`${SESSION_PREFIX}${sessionId}`));
+  if (redis && redis.status === "ready") {
+    promises.push(
+      redis.del(`${SESSION_PREFIX}${sessionId}`).catch((err) => {
+        if (logger) {
+          logger.warn({ err, sessionId }, "Failed to delete expired session from Redis");
+        }
+      })
+    );
   }
   if (pool) {
     promises.push(pool.query("DELETE FROM sessions WHERE session_id = $1", [sessionId]));

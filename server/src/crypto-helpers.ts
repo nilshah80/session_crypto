@@ -157,11 +157,44 @@ export function validateP256PublicKey(publicKeyBytes: Buffer): void {
   }
 }
 
+/**
+ * Parse integer environment variable with validation
+ */
+function parseIntEnv(name: string, defaultValue: number, min?: number, max?: number): number {
+  const raw = process.env[name];
+  if (!raw) return defaultValue;
+
+  const parsed = parseInt(raw, 10);
+  if (isNaN(parsed)) {
+    throw new Error(`Invalid ${name}: "${raw}" is not a valid integer`);
+  }
+  if (min !== undefined && parsed < min) {
+    throw new Error(`Invalid ${name}: ${parsed} is below minimum ${min}`);
+  }
+  if (max !== undefined && parsed > max) {
+    throw new Error(`Invalid ${name}: ${parsed} exceeds maximum ${max}`);
+  }
+  return parsed;
+}
+
 // Replay protection constants (with environment variable overrides)
-const TIMESTAMP_WINDOW_MS = parseInt(process.env.TIMESTAMP_WINDOW_MS || (5 * 60 * 1000).toString(), 10); // Default: ±5 minutes
-const NONCE_TTL_SEC = parseInt(process.env.NONCE_TTL_SEC || "300", 10); // Default: 5 minutes
+const TIMESTAMP_WINDOW_MS = parseIntEnv("TIMESTAMP_WINDOW_MS", 5 * 60 * 1000, 1000); // Default: ±5 minutes, min 1s
+const NONCE_TTL_SEC = parseIntEnv("NONCE_TTL_SEC", 300, 1); // Default: 5 minutes, min 1s
 const NONCE_PREFIX = "nonce:";
 const MEMORY_CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // Cleanup every 5 minutes
+
+// Memory nonce store limits (with environment variable overrides)
+// With sticky sessions, each pod handles a subset of clients, so limits can be conservative
+const MEMORY_NONCE_MAX_SIZE = parseIntEnv("MEMORY_NONCE_MAX_SIZE", 100000, 1000); // Default: 100K, min 1K
+const MEMORY_NONCE_CLEANUP_THRESHOLD = parseIntEnv("MEMORY_NONCE_CLEANUP_THRESHOLD", 80000, 100); // Default: 80K, min 100
+
+// Validate threshold < max to ensure cleanup triggers before capacity is reached
+if (MEMORY_NONCE_CLEANUP_THRESHOLD >= MEMORY_NONCE_MAX_SIZE) {
+  throw new Error(
+    `Invalid configuration: MEMORY_NONCE_CLEANUP_THRESHOLD (${MEMORY_NONCE_CLEANUP_THRESHOLD}) ` +
+    `must be less than MEMORY_NONCE_MAX_SIZE (${MEMORY_NONCE_MAX_SIZE})`
+  );
+}
 
 let redis: Redis | null = null;
 let logger: any = null;
@@ -170,14 +203,18 @@ let logger: any = null;
  * In-memory nonce store as fallback when Redis is unavailable
  * Note: With sticky sessions, this provides full replay protection in multi-pod deployments
  * as each client's requests are routed to the same pod.
+ *
+ * Bounded to MEMORY_NONCE_MAX_SIZE entries with threshold-triggered cleanup.
+ * Uses Map's insertion order for O(1) FIFO eviction instead of O(n log n) sorting.
  */
 const memoryNonceStore = new Map<string, number>();
 let cleanupInterval: NodeJS.Timeout | null = null;
 
 /**
  * Cleanup expired nonces from in-memory fallback store
+ * @returns number of entries cleaned
  */
-function cleanupExpiredMemoryNonces(): void {
+function cleanupExpiredMemoryNonces(): number {
   const now = Date.now();
   const ttlMs = NONCE_TTL_SEC * 1000;
   let cleaned = 0;
@@ -191,6 +228,47 @@ function cleanupExpiredMemoryNonces(): void {
 
   if (cleaned > 0 && logger) {
     logger.debug({ cleaned, remaining: memoryNonceStore.size }, "Cleaned expired memory nonces");
+  }
+
+  return cleaned;
+}
+
+/**
+ * Check if memory nonce store needs cleanup and trigger if threshold reached.
+ * Called BEFORE inserting new entries to ensure capacity.
+ *
+ * SECURITY: Fails closed - if at capacity after cleanup, rejects the request
+ * rather than evicting valid nonces (which could allow replay attacks).
+ *
+ * @throws Error("CAPACITY_EXCEEDED") if at max capacity after cleanup
+ */
+function ensureMemoryCapacity(): void {
+  if (memoryNonceStore.size >= MEMORY_NONCE_CLEANUP_THRESHOLD) {
+    const cleaned = cleanupExpiredMemoryNonces();
+
+    if (logger) {
+      logger.info(
+        {
+          sizeBeforeCleanup: memoryNonceStore.size + cleaned,
+          sizeAfterCleanup: memoryNonceStore.size,
+          threshold: MEMORY_NONCE_CLEANUP_THRESHOLD,
+          maxSize: MEMORY_NONCE_MAX_SIZE
+        },
+        "Triggered threshold-based nonce cleanup"
+      );
+    }
+
+    // SECURITY: Fail closed - reject requests rather than evict valid nonces
+    // Evicting valid nonces could allow replay attacks within TTL
+    if (memoryNonceStore.size >= MEMORY_NONCE_MAX_SIZE) {
+      if (logger) {
+        logger.error(
+          { size: memoryNonceStore.size, maxSize: MEMORY_NONCE_MAX_SIZE },
+          "Memory nonce store at capacity - failing closed to prevent replay vulnerability"
+        );
+      }
+      throw new Error("CAPACITY_EXCEEDED");
+    }
   }
 }
 
@@ -224,24 +302,31 @@ export function disposeReplayProtection(): void {
  * In-memory nonce check fallback
  * Provides replay protection when Redis is unavailable
  * With sticky sessions: full protection across requests
+ *
+ * Includes bounded memory protection with threshold-triggered cleanup
+ *
+ * NOTE: This is atomic within the Node.js event loop - the check-and-set
+ * happens synchronously without yielding. No two async operations can
+ * interleave between the get() and set() calls.
  */
 function checkAndStoreNonceInMemory(nonceKey: string): void {
   const now = Date.now();
+  const ttlMs = NONCE_TTL_SEC * 1000;
   const existingTimestamp = memoryNonceStore.get(nonceKey);
 
-  if (existingTimestamp !== undefined) {
-    // Check if nonce has expired in memory
-    const ttlMs = NONCE_TTL_SEC * 1000;
-    if (now - existingTimestamp < ttlMs) {
-      if (logger) {
-        logger.warn({ nonceKey }, "Replay attack detected (in-memory store)");
-      }
-      throw new Error("REPLAY_DETECTED");
+  if (existingTimestamp !== undefined && now - existingTimestamp < ttlMs) {
+    if (logger) {
+      logger.warn({ nonceKey }, "Replay attack detected (in-memory store)");
     }
-    // Nonce expired in memory, allow reuse
+    throw new Error("REPLAY_DETECTED");
   }
 
-  // Store nonce with current timestamp
+  // Check capacity BEFORE inserting to prevent unbounded growth on CAPACITY_EXCEEDED
+  // This ensures we don't insert entries that would exceed the limit
+  ensureMemoryCapacity();
+
+  // Store nonce after capacity check (atomic within event loop tick)
+  // This ensures no concurrent request can pass the check before we write
   memoryNonceStore.set(nonceKey, now);
 }
 
@@ -286,6 +371,11 @@ export async function validateReplayProtection(
       throw new Error("REPLAY_DETECTED");
     }
   } catch (error) {
+    // CRITICAL: Re-throw REPLAY_DETECTED - don't allow fallback to bypass Redis detection
+    if ((error as Error).message === "REPLAY_DETECTED") {
+      throw error;
+    }
+
     // Redis unavailable - fall back to in-memory nonce tracking
     if (logger) {
       logger.warn(

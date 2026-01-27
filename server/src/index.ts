@@ -30,12 +30,32 @@ const fastify = Fastify({
   logger: true,
 });
 
-// Configuration constants (with environment variable overrides)
-const REDIS_COMMAND_TIMEOUT_MS = parseInt(process.env.REDIS_COMMAND_TIMEOUT_MS || "5000", 10);
-const REDIS_CONNECTION_TIMEOUT_MS = parseInt(process.env.REDIS_CONNECTION_TIMEOUT_MS || "10000", 10);
-const SESSION_TTL_MIN_SEC = parseInt(process.env.SESSION_TTL_MIN_SEC || "300", 10);  // 5 minutes
-const SESSION_TTL_MAX_SEC = parseInt(process.env.SESSION_TTL_MAX_SEC || "3600", 10); // 1 hour
-const SESSION_TTL_DEFAULT_SEC = parseInt(process.env.SESSION_TTL_DEFAULT_SEC || "1800", 10); // 30 minutes
+/**
+ * Parse integer environment variable with validation
+ */
+function parseIntEnv(name: string, defaultValue: number, min?: number, max?: number): number {
+  const raw = process.env[name];
+  if (!raw) return defaultValue;
+
+  const parsed = parseInt(raw, 10);
+  if (isNaN(parsed)) {
+    throw new Error(`Invalid ${name}: "${raw}" is not a valid integer`);
+  }
+  if (min !== undefined && parsed < min) {
+    throw new Error(`Invalid ${name}: ${parsed} is below minimum ${min}`);
+  }
+  if (max !== undefined && parsed > max) {
+    throw new Error(`Invalid ${name}: ${parsed} exceeds maximum ${max}`);
+  }
+  return parsed;
+}
+
+// Configuration constants (with environment variable overrides and validation)
+const REDIS_COMMAND_TIMEOUT_MS = parseIntEnv("REDIS_COMMAND_TIMEOUT_MS", 5000, 100, 60000);
+const REDIS_CONNECTION_TIMEOUT_MS = parseIntEnv("REDIS_CONNECTION_TIMEOUT_MS", 10000, 1000, 60000);
+const SESSION_TTL_MIN_SEC = parseIntEnv("SESSION_TTL_MIN_SEC", 300, 60);  // 5 minutes default, min 1 minute
+const SESSION_TTL_MAX_SEC = parseIntEnv("SESSION_TTL_MAX_SEC", 3600, 60); // 1 hour default, min 1 minute
+const SESSION_TTL_DEFAULT_SEC = parseIntEnv("SESSION_TTL_DEFAULT_SEC", 1800, 60); // 30 minutes default, min 1 minute
 
 // Validate required environment variables
 function validateEnvironment(): void {
@@ -296,91 +316,94 @@ fastify.post("/transaction/purchase", async (request, reply) => {
     return reply.status(401).send({ error: "SESSION_EXPIRED" });
   }
 
-  // Build AAD from headers (server reconstructs it)
-  // AAD format: TIMESTAMP|NONCE|KID|CLIENTID
-  const aad = request.metrics!.measure("aad-build", () =>
-    buildAad(timestamp, nonce, kid, clientId)
-  );
-
-  // Get encrypted body (IV || ciphertext || tag)
-  let encryptedBody: Buffer;
+  // SECURITY: Wrap all session key usage in try/finally to ensure zeroization on all paths
   try {
-    const rawBody = request.body as Buffer | string;
-    encryptedBody =
-      typeof rawBody === "string" ? Buffer.from(rawBody) : Buffer.from(rawBody);
-
-    // Minimum length: IV (12) + tag (16) = 28 bytes
-    if (encryptedBody.length < 28) {
-      throw new Error("INVALID_BODY_LENGTH");
-    }
-  } catch (e) {
-    request.log.warn({ error: e }, "Failed to read encrypted body");
-    return reply.status(400).send({ error: "CRYPTO_ERROR" });
-  }
-
-  // Decrypt request body (body contains IV || ciphertext || tag)
-  let plaintext: Buffer;
-  try {
-    plaintext = request.metrics!.measure("aes-gcm-decrypt", () =>
-      aesGcmDecrypt(session.key, aad, encryptedBody)
+    // Build AAD from headers (server reconstructs it)
+    // AAD format: TIMESTAMP|NONCE|KID|CLIENTID
+    const aad = request.metrics!.measure("aad-build", () =>
+      buildAad(timestamp, nonce, kid, clientId)
     );
-  } catch (e) {
-    request.log.warn({ error: e }, "Decryption failed");
-    return reply.status(400).send({ error: "CRYPTO_ERROR" });
+
+    // Get encrypted body (IV || ciphertext || tag)
+    let encryptedBody: Buffer;
+    try {
+      const rawBody = request.body as Buffer | string;
+      encryptedBody =
+        typeof rawBody === "string" ? Buffer.from(rawBody) : Buffer.from(rawBody);
+
+      // Minimum length: IV (12) + tag (16) = 28 bytes
+      if (encryptedBody.length < 28) {
+        throw new Error("INVALID_BODY_LENGTH");
+      }
+    } catch (e) {
+      request.log.warn({ error: e }, "Failed to read encrypted body");
+      return reply.status(400).send({ error: "CRYPTO_ERROR" });
+    }
+
+    // Decrypt request body (body contains IV || ciphertext || tag)
+    let plaintext: Buffer;
+    try {
+      plaintext = request.metrics!.measure("aes-gcm-decrypt", () =>
+        aesGcmDecrypt(session.key, aad, encryptedBody)
+      );
+    } catch (e) {
+      request.log.warn({ error: e }, "Decryption failed");
+      return reply.status(400).send({ error: "CRYPTO_ERROR" });
+    }
+
+    // Parse decrypted JSON
+    let requestData: { schemeCode: string; amount: number };
+    try {
+      requestData = JSON.parse(plaintext.toString("utf8"));
+    } catch (e) {
+      request.log.warn({ error: e }, "Failed to parse decrypted JSON");
+      return reply.status(400).send({ error: "CRYPTO_ERROR" });
+    }
+
+    request.log.info({ requestData }, "Decrypted request received");
+
+    // ===== BUSINESS LOGIC =====
+    // Process the transaction (mock implementation)
+    const responseData = {
+      status: "SUCCESS",
+      transactionId: `TXN-${crypto.randomBytes(8).toString("hex").toUpperCase()}`,
+      schemeCode: requestData.schemeCode,
+      amount: requestData.amount,
+      timestamp: new Date().toISOString(),
+      message: `Purchase of ${requestData.amount} in scheme ${requestData.schemeCode} completed successfully`,
+    };
+    // ===== END BUSINESS LOGIC =====
+
+    // Encrypt response
+    const responsePlaintext = Buffer.from(JSON.stringify(responseData), "utf8");
+    const responseNonce = crypto.randomUUID();
+    const responseTimestamp = Date.now().toString();
+    const responseIdempotencyKey = `${responseTimestamp}.${responseNonce}`;
+
+    // Build response AAD
+    // AAD format: TIMESTAMP|NONCE|KID|CLIENTID
+    const responseAad = buildAad(
+      responseTimestamp,
+      responseNonce,
+      kid,
+      clientId
+    );
+
+    // Encrypt - returns IV || ciphertext || tag
+    const encryptedResponse = request.metrics!.measure("aes-gcm-encrypt", () =>
+      aesGcmEncrypt(session.key, responseAad, responsePlaintext)
+    );
+
+    // Set response headers
+    reply.header("X-Kid", kid);
+    reply.header("X-Idempotency-Key", responseIdempotencyKey);
+    reply.header("Content-Type", "application/octet-stream");
+
+    return reply.send(encryptedResponse);
+  } finally {
+    // SECURITY: Always zeroize session key, even on error paths
+    session.key.fill(0);
   }
-
-  // Parse decrypted JSON
-  let requestData: { schemeCode: string; amount: number };
-  try {
-    requestData = JSON.parse(plaintext.toString("utf8"));
-  } catch (e) {
-    request.log.warn({ error: e }, "Failed to parse decrypted JSON");
-    return reply.status(400).send({ error: "CRYPTO_ERROR" });
-  }
-
-  request.log.info({ requestData }, "Decrypted request received");
-
-  // ===== BUSINESS LOGIC =====
-  // Process the transaction (mock implementation)
-  const responseData = {
-    status: "SUCCESS",
-    transactionId: `TXN-${crypto.randomBytes(8).toString("hex").toUpperCase()}`,
-    schemeCode: requestData.schemeCode,
-    amount: requestData.amount,
-    timestamp: new Date().toISOString(),
-    message: `Purchase of ${requestData.amount} in scheme ${requestData.schemeCode} completed successfully`,
-  };
-  // ===== END BUSINESS LOGIC =====
-
-  // Encrypt response
-  const responsePlaintext = Buffer.from(JSON.stringify(responseData), "utf8");
-  const responseNonce = crypto.randomUUID();
-  const responseTimestamp = Date.now().toString();
-  const responseIdempotencyKey = `${responseTimestamp}.${responseNonce}`;
-
-  // Build response AAD
-  // AAD format: TIMESTAMP|NONCE|KID|CLIENTID
-  const responseAad = buildAad(
-    responseTimestamp,
-    responseNonce,
-    kid,
-    clientId
-  );
-
-  // Encrypt - returns IV || ciphertext || tag
-  const encryptedResponse = request.metrics!.measure("aes-gcm-encrypt", () =>
-    aesGcmEncrypt(session.key, responseAad, responsePlaintext)
-  );
-
-  // SECURITY: Zeroize session key after use (each getSession creates a new buffer)
-  session.key.fill(0);
-
-  // Set response headers
-  reply.header("X-Kid", kid);
-  reply.header("X-Idempotency-Key", responseIdempotencyKey);
-  reply.header("Content-Type", "application/octet-stream");
-
-  return reply.send(encryptedResponse);
 });
 
 // Health check
