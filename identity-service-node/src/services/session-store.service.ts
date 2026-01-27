@@ -1,7 +1,7 @@
 import { cacheService } from './cache.service';
 import { sessionRepository, SessionRepository } from '../repositories';
 import { SessionData } from '../types/session.types';
-import log from '../utils/logger';
+import { logger } from '../utils/logger';
 
 /**
  * SessionStoreService - Coordinates between cache and repository
@@ -40,16 +40,14 @@ export class SessionStoreService {
         const cacheKey = `${SESSION_CACHE_PREFIX}${sessionId}`;
         await this.cache.set(cacheKey, sessionData, ttlSec);
       } catch (cacheError) {
-        log.warn('SessionStoreService', 'Failed to cache session in Redis', {
+        logger.warn('SessionStoreService', 'Failed to cache session in Redis', undefined, undefined, undefined, undefined, {
           sessionId,
           error: (cacheError as Error).message,
         });
         // Don't throw - PostgreSQL write succeeded
       }
-
-      log.info('SessionStoreService', 'Session stored', { sessionId, ttlSec });
     } catch (error) {
-      log.error('SessionStoreService', 'Failed to store session', error as Error, {
+      logger.error('SessionStoreService', 'Failed to store session', error, undefined, undefined, undefined, {
         sessionId,
       });
       throw error;
@@ -68,12 +66,12 @@ export class SessionStoreService {
       // 1. Try cache first (Redis → LRU fallback)
       const cachedSession = await this.cache.get<SessionData>(cacheKey);
       if (cachedSession) {
-        log.debug('SessionStoreService', 'Session found in cache', { sessionId });
+        logger.debug('SessionStoreService', 'Session found in cache', undefined, { sessionId });
         return cachedSession;
       }
 
       // 2. Fallback to PostgreSQL
-      log.debug('SessionStoreService', 'Session not in cache, checking PostgreSQL', {
+      logger.debug('SessionStoreService', 'Session not in cache, checking PostgreSQL', undefined, {
         sessionId,
       });
       const sessionWithExpiry = await this.repository.getSessionById(sessionId);
@@ -90,7 +88,7 @@ export class SessionStoreService {
 
           await this.cache.set(cacheKey, sessionWithExpiry.data, remainingTtlSec);
         } catch (cacheError) {
-          log.warn('SessionStoreService', 'Failed to warm up cache', {
+          logger.warn('SessionStoreService', 'Failed to warm up cache', undefined, undefined, undefined, undefined, {
             sessionId,
             error: (cacheError as Error).message,
           });
@@ -101,7 +99,7 @@ export class SessionStoreService {
 
       return null;
     } catch (error) {
-      log.error('SessionStoreService', 'Failed to get session', error as Error, {
+      logger.error('SessionStoreService', 'Failed to get session', error, undefined, undefined, undefined, {
         sessionId,
       });
       throw error;
@@ -121,20 +119,16 @@ export class SessionStoreService {
       const [deleted] = await Promise.all([
         this.repository.deleteSession(sessionId),
         this.cache.delete(cacheKey).catch(err => {
-          log.warn('SessionStoreService', 'Failed to delete from cache', {
+          logger.warn('SessionStoreService', 'Failed to delete from cache', undefined, undefined, undefined, undefined, {
             sessionId,
             error: (err as Error).message,
           });
         }),
       ]);
 
-      if (deleted) {
-        log.info('SessionStoreService', 'Session deleted', { sessionId });
-      }
-
       return deleted;
     } catch (error) {
-      log.error('SessionStoreService', 'Failed to delete session', error as Error, {
+      logger.error('SessionStoreService', 'Failed to delete session', error, undefined, undefined, undefined, {
         sessionId,
       });
       throw error;

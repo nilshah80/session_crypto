@@ -12,7 +12,7 @@ import {
   generateSessionId,
   zeroizeBuffer,
 } from '../utils/crypto-helpers';
-import log from '../utils/logger';
+import { logger } from '../utils/logger';
 
 /**
  * SessionService - Business logic for session management
@@ -84,12 +84,6 @@ export class SessionService {
       zeroizeBuffer(sharedSecret);
       zeroizeBuffer(sessionKey);
 
-      log.info('SessionService', 'Session created successfully', {
-        sessionId,
-        clientId,
-        ttlSec,
-      });
-
       // 11. Return response
       return {
         sessionId,
@@ -100,7 +94,7 @@ export class SessionService {
     } catch (error) {
       // Ensure sensitive data is zeroized even on error
       zeroizeBuffer(sharedSecret);
-      log.error('SessionService', 'Failed to create session', error as Error, {
+      logger.error('SessionService', 'Failed to create session', error, undefined, undefined, undefined, {
         clientId,
       });
       throw error;

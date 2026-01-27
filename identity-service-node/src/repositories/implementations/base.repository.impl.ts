@@ -1,7 +1,7 @@
 import { PoolClient, QueryResult, QueryResultRow } from 'pg';
 import { BaseRepository } from '../interfaces/base.repository';
 import { databaseService } from '../../services/database.service';
-import log from '../../utils/logger';
+import { logger } from '../../utils/logger';
 import { config } from '../../config';
 
 /**
@@ -23,7 +23,7 @@ export abstract class BaseRepositoryImpl implements BaseRepository {
       const duration = Date.now() - start;
 
       if (config.NODE_ENV === 'development' && config.LOG_LEVEL === 'debug') {
-        log.debug('BaseRepository', 'Query executed', {
+        logger.debug('BaseRepository', 'Query executed', undefined, {
           query: text.substring(0, 100) + (text.length > 100 ? '...' : ''),
           duration: `${duration}ms`,
           rows: result.rowCount || 0,
@@ -33,7 +33,7 @@ export abstract class BaseRepositoryImpl implements BaseRepository {
       return result;
     } catch (error) {
       const duration = Date.now() - start;
-      log.error('BaseRepository', 'Query failed', error as Error, {
+      logger.error('BaseRepository', 'Query failed', error, undefined, undefined, undefined, {
         query: text.substring(0, 100) + (text.length > 100 ? '...' : ''),
         duration: `${duration}ms`,
         params: params ? '[REDACTED]' : undefined,
@@ -68,7 +68,7 @@ export abstract class BaseRepositoryImpl implements BaseRepository {
       const result = await this.query('SELECT 1 as health');
       return result.rows.length === 1 && result.rows[0]?.health === 1;
     } catch (error) {
-      log.error('BaseRepository', 'Database health check failed', error as Error);
+      logger.error('BaseRepository', 'Database health check failed', error as Error);
       return false;
     }
   }

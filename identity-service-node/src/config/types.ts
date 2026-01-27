@@ -3,7 +3,14 @@ export interface Config {
   HOST: string;
   NODE_ENV: string;
   PORT: number;
+  SERVICE_NAME: string;
+
+  // Logging
   LOG_LEVEL: string;
+  LOG_FORMAT: string;
+  LOG_SAMPLE_RATE: number;
+  SLOW_THRESHOLD_MS: number;
+  MAX_LOG_BODY_SIZE_BYTES: number;
 
   // Database
   DATABASE_HOST: string;

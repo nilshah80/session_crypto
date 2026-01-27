@@ -1,7 +1,7 @@
 import { FastifyRequest, FastifyReply } from 'fastify';
 import { sessionService } from '../services/session.service';
 import { SessionInitBody } from '../types/session.types';
-import log from '../utils/logger';
+import { logger } from '../utils/logger';
 
 /**
  * Session controller - HTTP handlers for session endpoints
@@ -23,7 +23,7 @@ export async function initSession(
 
     // Validate required headers
     if (!idempotencyKey) {
-      log.warn('SessionController', 'Missing X-Idempotency-Key header');
+      logger.warn('SessionController', 'Missing X-Idempotency-Key header');
       reply.code(400).send({
         error: 'Bad Request',
         message: 'X-Idempotency-Key header is required',
@@ -32,7 +32,7 @@ export async function initSession(
     }
 
     if (!clientId) {
-      log.warn('SessionController', 'Missing X-ClientId header');
+      logger.warn('SessionController', 'Missing X-ClientId header');
       reply.code(400).send({
         error: 'Bad Request',
         message: 'X-ClientId header is required',
@@ -44,7 +44,7 @@ export async function initSession(
     const { clientPublicKey, ttlSec } = request.body;
 
     if (!clientPublicKey) {
-      log.warn('SessionController', 'Missing clientPublicKey in body');
+      logger.warn('SessionController', 'Missing clientPublicKey in body');
       reply.code(400).send({
         error: 'Bad Request',
         message: 'clientPublicKey is required',
@@ -73,7 +73,7 @@ export async function initSession(
 
     // Handle specific error types
     if (err.message === 'TIMESTAMP_INVALID') {
-      log.warn('SessionController', 'Invalid timestamp', { error: err.message });
+      logger.warn('SessionController', 'Invalid timestamp', undefined, undefined, undefined, undefined, { error: err.message });
       reply.code(400).send({
         error: 'Bad Request',
         message: 'Invalid or expired timestamp',
@@ -82,7 +82,7 @@ export async function initSession(
     }
 
     if (err.message === 'NONCE_INVALID') {
-      log.warn('SessionController', 'Invalid nonce', { error: err.message });
+      logger.warn('SessionController', 'Invalid nonce', undefined, undefined, undefined, undefined, { error: err.message });
       reply.code(400).send({
         error: 'Bad Request',
         message: 'Invalid nonce format',
@@ -91,7 +91,7 @@ export async function initSession(
     }
 
     if (err.message === 'REPLAY_DETECTED') {
-      log.warn('SessionController', 'Replay attack detected', { error: err.message });
+      logger.warn('SessionController', 'Replay attack detected', undefined, undefined, undefined, undefined, { error: err.message });
       reply.code(409).send({
         error: 'Conflict',
         message: 'Request already processed (replay detected)',
@@ -100,7 +100,7 @@ export async function initSession(
     }
 
     if (err.message === 'SERVICE_UNAVAILABLE') {
-      log.error('SessionController', 'Service unavailable', err);
+      logger.error('SessionController', 'Service unavailable', err);
       reply.code(503).send({
         error: 'Service Unavailable',
         message: 'Replay protection service temporarily unavailable',
@@ -114,7 +114,7 @@ export async function initSession(
       err.message === 'POINT_NOT_ON_CURVE' ||
       err.message === 'INVALID_KEY_TYPE'
     ) {
-      log.warn('SessionController', 'Invalid client public key', { error: err.message });
+      logger.warn('SessionController', 'Invalid client public key', undefined, undefined, undefined, undefined, { error: err.message });
       reply.code(400).send({
         error: 'Bad Request',
         message: 'Invalid client public key',
@@ -123,7 +123,7 @@ export async function initSession(
     }
 
     if (err.message === 'INVALID_IDEMPOTENCY_KEY_FORMAT') {
-      log.warn('SessionController', 'Invalid idempotency key format', {
+      logger.warn('SessionController', 'Invalid idempotency key format', undefined, undefined, undefined, undefined, {
         error: err.message,
       });
       reply.code(400).send({
@@ -134,7 +134,7 @@ export async function initSession(
     }
 
     if (err.message === 'TTL_INVALID') {
-      log.warn('SessionController', 'Invalid TTL value', { error: err.message });
+      logger.warn('SessionController', 'Invalid TTL value', undefined, undefined, undefined, undefined, { error: err.message });
       reply.code(400).send({
         error: 'Bad Request',
         message: 'TTL must be a non-negative integer',
@@ -143,7 +143,7 @@ export async function initSession(
     }
 
     // Generic error handling
-    log.error('SessionController', 'Session init failed', err);
+    logger.error('SessionController', 'Session init failed', err);
     reply.code(500).send({
       error: 'Internal Server Error',
       message: 'Failed to initialize session',

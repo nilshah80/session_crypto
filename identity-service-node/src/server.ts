@@ -7,7 +7,7 @@ import { registerRoutes } from './routes';
 import { databaseService } from './services/database.service';
 import { cacheService } from './services/cache.service';
 import { sessionRepository } from './repositories';
-import log from './utils/logger';
+import { logger } from './utils/logger';
 
 /**
  * Identity Service Node - Main server
@@ -50,12 +50,8 @@ async function registerPlugins(): Promise<void> {
  * Initialize application
  */
 async function initialize(): Promise<void> {
-  log.info('Server', 'Initializing application');
-
   // Ensure database tables exist
   await sessionRepository.ensureSessionsTable();
-
-  log.info('Server', 'Application initialized successfully');
 }
 
 /**
@@ -77,13 +73,8 @@ async function start(): Promise<void> {
       port: config.PORT,
       host: config.HOST,
     });
-
-    log.info('Server', `Server listening on ${config.HOST}:${config.PORT}`, {
-      env: config.NODE_ENV,
-      port: config.PORT,
-    });
   } catch (error) {
-    log.error('Server', 'Failed to start server', error as Error);
+    logger.error('Server', 'Failed to start server', error as Error);
     process.exit(1);
   }
 }
@@ -92,25 +83,25 @@ async function start(): Promise<void> {
  * Graceful shutdown
  */
 async function shutdown(signal: string): Promise<void> {
-  log.info('Server', `Received ${signal}, starting graceful shutdown`);
+  logger.info('Server', `Received ${signal}, starting graceful shutdown`);
 
   try {
     // Stop accepting new connections
     await fastify.close();
-    log.info('Server', 'Fastify closed');
+    logger.info('Server', 'Fastify closed');
 
     // Close cache connection
     await cacheService.close();
-    log.info('Server', 'Cache closed');
+    logger.info('Server', 'Cache closed');
 
     // Close database connection
     await databaseService.close();
-    log.info('Server', 'Database closed');
+    logger.info('Server', 'Database closed');
 
-    log.info('Server', 'Graceful shutdown completed');
+    logger.info('Server', 'Graceful shutdown completed');
     process.exit(0);
   } catch (error) {
-    log.error('Server', 'Error during shutdown', error as Error);
+    logger.error('Server', 'Error during shutdown', error as Error);
     process.exit(1);
   }
 }
@@ -121,12 +112,12 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 
 // Handle uncaught errors
 process.on('uncaughtException', error => {
-  log.error('Server', 'Uncaught exception', error);
+  logger.error('Server', 'Uncaught exception', error);
   shutdown('uncaughtException');
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-  log.error('Server', 'Unhandled rejection', reason as Error, {
+  logger.error('Server', 'Unhandled rejection', reason, undefined, undefined, undefined, {
     promise: promise.toString(),
   });
   shutdown('unhandledRejection');

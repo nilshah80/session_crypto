@@ -1,7 +1,7 @@
 import { SessionRepository } from '../interfaces/session.repository';
 import { BaseRepositoryImpl } from './base.repository.impl';
 import { SessionData, SessionWithExpiry, SessionRow } from '../../types/session.types';
-import log from '../../utils/logger';
+import { logger } from '../../utils/logger';
 
 /**
  * Session repository implementation
@@ -30,9 +30,8 @@ export class SessionRepositoryImpl extends BaseRepositoryImpl implements Session
 
     try {
       await this.query(migrationSql);
-      log.info('SessionRepository', 'Sessions table ensured');
     } catch (error) {
-      log.error('SessionRepository', 'Failed to ensure sessions table', error as Error);
+      logger.error('SessionRepository', 'Failed to ensure sessions table', error as Error);
       throw error;
     }
   }
@@ -61,9 +60,9 @@ export class SessionRepositoryImpl extends BaseRepositoryImpl implements Session
         ]
       );
 
-      log.debug('SessionRepository', 'Session created', { sessionId });
+      logger.debug('SessionRepository', 'Session created', undefined, { sessionId });
     } catch (error) {
-      log.error('SessionRepository', 'Failed to create session', error as Error, {
+      logger.error('SessionRepository', 'Failed to create session', error, undefined, undefined, undefined, {
         sessionId,
       });
       throw error;
@@ -93,7 +92,7 @@ export class SessionRepositoryImpl extends BaseRepositoryImpl implements Session
       // Check if session has expired
       const now = new Date();
       if (row.expires_at && row.expires_at < now) {
-        log.debug('SessionRepository', 'Session expired', { sessionId });
+        logger.debug('SessionRepository', 'Session expired', undefined, { sessionId });
         // Clean up expired session
         await this.deleteSession(sessionId);
         return null;
@@ -105,7 +104,7 @@ export class SessionRepositoryImpl extends BaseRepositoryImpl implements Session
         expiresAt: row.expires_at,
       };
     } catch (error) {
-      log.error('SessionRepository', 'Failed to get session', error as Error, {
+      logger.error('SessionRepository', 'Failed to get session', error, undefined, undefined, undefined, {
         sessionId,
       });
       throw error;
@@ -123,12 +122,12 @@ export class SessionRepositoryImpl extends BaseRepositoryImpl implements Session
 
       const deleted = (result.rowCount ?? 0) > 0;
       if (deleted) {
-        log.debug('SessionRepository', 'Session deleted', { sessionId });
+        logger.debug('SessionRepository', 'Session deleted', undefined, { sessionId });
       }
 
       return deleted;
     } catch (error) {
-      log.error('SessionRepository', 'Failed to delete session', error as Error, {
+      logger.error('SessionRepository', 'Failed to delete session', error, undefined, undefined, undefined, {
         sessionId,
       });
       throw error;

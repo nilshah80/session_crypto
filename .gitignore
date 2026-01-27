@@ -70,3 +70,4 @@ server-go/server
 *.exe
 nul
 *.txt
+identity-service-node/.npmrc

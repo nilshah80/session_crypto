@@ -37,7 +37,14 @@ export const config: Config = {
   HOST: getEnvVar('HOST', '0.0.0.0'),
   NODE_ENV: getEnvVar('NODE_ENV', 'development'),
   PORT: getEnvNumber('PORT', 3000),
+  SERVICE_NAME: getEnvVar('SERVICE_NAME', 'identity-service-node'),
+
+  // Logging
   LOG_LEVEL: getEnvVar('LOG_LEVEL', 'info'),
+  LOG_FORMAT: getEnvVar('LOG_FORMAT', 'json'),
+  LOG_SAMPLE_RATE: getEnvNumber('LOG_SAMPLE_RATE', 100),
+  SLOW_THRESHOLD_MS: getEnvNumber('SLOW_THRESHOLD_MS', 500),
+  MAX_LOG_BODY_SIZE_BYTES: getEnvNumber('MAX_LOG_BODY_SIZE_BYTES', 10240),
 
   // Database
   DATABASE_HOST: getEnvVar('DATABASE_HOST', 'localhost'),

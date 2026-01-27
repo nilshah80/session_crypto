@@ -1,6 +1,6 @@
 import { Pool, PoolClient } from 'pg';
 import { config } from '../config';
-import log from '../utils/logger';
+import { logger } from '../utils/logger';
 
 /**
  * Database connection pool service
@@ -27,17 +27,17 @@ class DatabaseService {
 
     // Handle pool errors
     this.pool.on('error', err => {
-      log.error('DatabaseService', 'Unexpected error on idle client', err as Error);
+      logger.error('DatabaseService', 'Unexpected error on idle client', err as Error);
     });
 
     // Log pool events in development
     if (config.NODE_ENV === 'development') {
       this.pool.on('connect', () => {
-        log.debug('DatabaseService', 'New client connected to database');
+        logger.debug('DatabaseService', 'New client connected to database');
       });
 
       this.pool.on('remove', () => {
-        log.debug('DatabaseService', 'Client removed from pool');
+        logger.debug('DatabaseService', 'Client removed from pool');
       });
     }
   }
@@ -71,7 +71,7 @@ class DatabaseService {
    * Close all connections (for graceful shutdown)
    */
   async close(): Promise<void> {
-    log.info('DatabaseService', 'Closing database pool');
+    logger.info('DatabaseService', 'Closing database pool');
     await this.pool.end();
   }
 }

@@ -12,6 +12,8 @@
     "test:integration": "jest --selectProjects integration",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",
+    "test:negative": "ts-node negative-tests.ts",
+    "test:positive": "ts-node positive-tests.ts",
     "lint": "eslint src/**/*.ts",
     "lint:fix": "eslint src/**/*.ts --fix",
     "format": "prettier --write src/**/*.ts"
@@ -27,6 +29,7 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "@abslamcpr-backend/structured-logger": "^1.1.2",
     "@fastify/cors": "^11.1.0",
     "@fastify/formbody": "^8.0.2",
     "@fastify/helmet": "^13.0.1",
@@ -35,7 +38,6 @@
     "pg": "^8.11.3",
     "redis": "^4.6.10",
     "uuid": "^9.0.1",
-    "winston": "^3.11.0",
     "zod": "^3.22.4"
   },
   "devDependencies": {

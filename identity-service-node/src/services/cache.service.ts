@@ -1,6 +1,6 @@
 import { createClient, RedisClientType } from 'redis';
 import { config } from '../config';
-import log from '../utils/logger';
+import { logger } from '../utils/logger';
 import { LRUCache } from '../utils/lru-cache';
 import { CACHE } from '../constants';
 
@@ -40,7 +40,7 @@ class RedisCacheService implements CacheService {
         connectTimeout: CACHE.REDIS_CONNECTION_TIMEOUT_MS,
         reconnectStrategy: (retries: number) => {
           if (retries > config.REDIS_MAX_RECONNECT_ATTEMPTS) {
-            log.error(
+            logger.error(
               'CacheService',
               `Redis reconnection failed after ${config.REDIS_MAX_RECONNECT_ATTEMPTS} attempts`
             );
@@ -65,7 +65,7 @@ class RedisCacheService implements CacheService {
     this.setupEventHandlers();
     this.startPeriodicReconnect();
     void this.connect().catch(err => {
-      log.error('CacheService', 'Redis initial connection failed', err as Error);
+      logger.error('CacheService', 'Redis initial connection failed', err as Error);
     });
   }
 
@@ -75,9 +75,6 @@ class RedisCacheService implements CacheService {
   private startPeriodicReconnect(): void {
     this.periodicReconnectInterval = setInterval(() => {
       if (!this.connected && !this.reconnectInProgress) {
-        log.info('CacheService', 'Attempting periodic Redis reconnection', {
-          intervalMs: this.PERIODIC_RECONNECT_INTERVAL_MS,
-        });
         this.attemptReconnect();
       }
     }, this.PERIODIC_RECONNECT_INTERVAL_MS);
@@ -103,36 +100,29 @@ class RedisCacheService implements CacheService {
       }
 
       await this.client.connect();
-      log.info('CacheService', 'Redis reconnected successfully');
     } catch (error) {
-      log.warn('CacheService', `Redis periodic reconnection failed: ${(error as Error).message}`);
+      logger.warn('CacheService', `Redis periodic reconnection failed: ${(error as Error).message}`);
     } finally {
       this.reconnectInProgress = false;
     }
   }
 
   private setupEventHandlers(): void {
-    this.client.on('connect', () => {
-      log.info('CacheService', 'Redis client connecting');
-    });
-
     this.client.on('ready', () => {
-      log.info('CacheService', 'Redis client ready');
       this.connected = true;
     });
 
     this.client.on('error', err => {
-      log.error('CacheService', 'Redis client error', err as Error);
+      logger.error('CacheService', 'Redis client error', err as Error);
       this.connected = false;
     });
 
     this.client.on('end', () => {
-      log.info('CacheService', 'Redis client disconnected');
       this.connected = false;
     });
 
     this.client.on('reconnecting', () => {
-      log.info('CacheService', 'Redis client reconnecting');
+      // Reconnecting silently
     });
   }
 
@@ -140,7 +130,7 @@ class RedisCacheService implements CacheService {
     try {
       await this.client.connect();
     } catch (error) {
-      log.error('CacheService', 'Failed to connect to Redis', error as Error);
+      logger.error('CacheService', 'Failed to connect to Redis', error as Error);
       throw error;
     }
   }
@@ -154,8 +144,6 @@ class RedisCacheService implements CacheService {
     }
 
     this.reconnectInProgress = true;
-
-    log.info('CacheService', 'Redis disconnected, client will attempt automatic reconnection');
 
     const resetTimer = setTimeout(() => {
       this.reconnectInProgress = false;
@@ -186,7 +174,7 @@ class RedisCacheService implements CacheService {
     } catch (error) {
       this.connected = false;
       this.tryReconnectAsync();
-      log.warn('CacheService', `Cache get failed, using fallback: ${key}`, {
+      logger.warn('CacheService', `Cache get failed, using fallback: ${key}`, undefined, undefined, undefined, undefined, {
         error: (error as Error).message,
       });
       return this.fallbackCache.get(key) as T | null;
@@ -219,7 +207,7 @@ class RedisCacheService implements CacheService {
     } catch (error) {
       this.connected = false;
       this.tryReconnectAsync();
-      log.warn('CacheService', `Cache set failed, using fallback: ${key}`, {
+      logger.warn('CacheService', `Cache set failed, using fallback: ${key}`, undefined, undefined, undefined, undefined, {
         ttl,
         error: (error as Error).message,
       });
@@ -242,7 +230,7 @@ class RedisCacheService implements CacheService {
     } catch (error) {
       this.connected = false;
       this.tryReconnectAsync();
-      log.error('CacheService', `Cache set failed (strict mode): ${key}`, error as Error, {
+      logger.error('CacheService', `Cache set failed (strict mode): ${key}`, error as Error, undefined, undefined, undefined, {
         key,
         ttl,
       });
@@ -266,7 +254,7 @@ class RedisCacheService implements CacheService {
     } catch (error) {
       this.connected = false;
       this.tryReconnectAsync();
-      log.warn('CacheService', `Cache delete failed, fallback already cleared: ${key}`, {
+      logger.warn('CacheService', `Cache delete failed, fallback already cleared: ${key}`, undefined, undefined, undefined, undefined, {
         error: (error as Error).message,
       });
     }
@@ -290,7 +278,7 @@ class RedisCacheService implements CacheService {
     } catch (error) {
       this.connected = false;
       this.tryReconnectAsync();
-      log.warn('CacheService', `Cache exists check failed, using fallback: ${key}`, {
+      logger.warn('CacheService', `Cache exists check failed, using fallback: ${key}`, undefined, undefined, undefined, undefined, {
         error: (error as Error).message,
       });
       return this.fallbackCache.has(key);
@@ -313,7 +301,7 @@ class RedisCacheService implements CacheService {
     } catch (error) {
       this.connected = false;
       this.tryReconnectAsync();
-      log.error('CacheService', `Cache exists check failed (strict mode): ${key}`, error as Error);
+      logger.error('CacheService', `Cache exists check failed (strict mode): ${key}`, error as Error);
       throw error;
     }
   }
@@ -330,7 +318,7 @@ class RedisCacheService implements CacheService {
       await this.client.ping();
       return true;
     } catch (error) {
-      log.error('CacheService', 'Health check failed', error as Error);
+      logger.error('CacheService', 'Health check failed', error as Error);
       return false;
     }
   }
@@ -347,7 +335,6 @@ class RedisCacheService implements CacheService {
     this.fallbackCache.dispose();
 
     if (this.client.isOpen) {
-      log.info('CacheService', 'Closing Redis connection');
       await this.client.quit();
     }
   }

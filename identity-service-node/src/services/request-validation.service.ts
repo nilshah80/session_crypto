@@ -1,7 +1,7 @@
 import { cacheService } from './cache.service';
 import { config } from '../config';
 import { CRYPTO } from '../constants';
-import log from '../utils/logger';
+import { logger } from '../utils/logger';
 
 /**
  * RequestValidationService - Generic replay protection service
@@ -35,7 +35,7 @@ export class RequestValidationService {
   async validateTimestampAndNonce(timestamp: string, nonce: string): Promise<void> {
     // 1. Validate nonce length
     if (!nonce || nonce.length < CRYPTO.MIN_NONCE_LENGTH) {
-      log.warn('RequestValidationService', 'Nonce too short', {
+      logger.warn('RequestValidationService', 'Nonce too short', undefined, undefined, undefined, undefined, {
         nonceLength: nonce?.length || 0,
       });
       throw new Error('NONCE_INVALID');
@@ -46,12 +46,12 @@ export class RequestValidationService {
     const now = Date.now();
 
     if (isNaN(ts)) {
-      log.warn('RequestValidationService', 'Invalid timestamp format', { timestamp });
+      logger.warn('RequestValidationService', 'Invalid timestamp format', undefined, undefined, undefined, undefined, { timestamp });
       throw new Error('TIMESTAMP_INVALID');
     }
 
     if (Math.abs(now - ts) > this.timestampWindowMs) {
-      log.warn('RequestValidationService', 'Timestamp outside window', {
+      logger.warn('RequestValidationService', 'Timestamp outside window', undefined, undefined, undefined, undefined, {
         timestamp: ts,
         now,
         diff: now - ts,
@@ -68,7 +68,7 @@ export class RequestValidationService {
       const exists = await cacheService.existsStrict(nonceKey);
 
       if (exists) {
-        log.warn('RequestValidationService', 'Replay attack detected', {
+        logger.warn('RequestValidationService', 'Replay attack detected', undefined, undefined, undefined, undefined, {
           nonce,
           timestamp: ts,
         });
@@ -78,7 +78,7 @@ export class RequestValidationService {
       // Store nonce with TTL (STRICT mode - throws if Redis unavailable)
       await cacheService.setStrict(nonceKey, true, this.nonceTtlSec);
 
-      log.debug('RequestValidationService', 'Request validated', {
+      logger.debug('RequestValidationService', 'Request validated', undefined, {
         timestamp: ts,
         nonceTtl: this.nonceTtlSec,
       });
@@ -89,7 +89,7 @@ export class RequestValidationService {
       }
 
       // Redis unavailable - fail closed for security
-      log.error(
+      logger.error(
         'RequestValidationService',
         'Redis unavailable for replay protection',
         error as Error

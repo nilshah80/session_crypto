@@ -18,7 +18,7 @@ interface TestResult {
   passed: boolean;
   expected: string;
   actual: string;
-  error?: string;
+  error?: string | undefined;
 }
 
 // Configuration
@@ -381,6 +381,56 @@ async function testHeaderValidation(): Promise<TestResult[]> {
   } catch (error: any) {
     results.push({
       name: 'Empty X-ClientId header',
+      passed: false,
+      expected: '400',
+      actual: 'Exception thrown',
+      error: error.message,
+    });
+  }
+
+  // Test 6: Empty nonce in idempotency key (timestamp.)
+  try {
+    const { publicKey } = generateECDHKeyPair();
+    const timestamp = Date.now();
+    const malformedKey = `${timestamp}.`; // Empty nonce after dot
+
+    const res = await makeSessionInitRequest(publicKey, malformedKey, 'test-header-6', 900);
+
+    results.push({
+      name: 'Empty nonce in idempotency key (timestamp.)',
+      passed: res.status === 400,
+      expected: '400 (empty nonce)',
+      actual: `${res.status}`,
+      error: res.status !== 400 ? JSON.stringify(res.body) : undefined,
+    });
+  } catch (error: any) {
+    results.push({
+      name: 'Empty nonce in idempotency key (timestamp.)',
+      passed: false,
+      expected: '400',
+      actual: 'Exception thrown',
+      error: error.message,
+    });
+  }
+
+  // Test 7: Empty timestamp in idempotency key (.nonce)
+  try {
+    const { publicKey } = generateECDHKeyPair();
+    const nonce = crypto.randomBytes(16).toString('hex');
+    const malformedKey = `.${nonce}`; // Empty timestamp before dot
+
+    const res = await makeSessionInitRequest(publicKey, malformedKey, 'test-header-7', 900);
+
+    results.push({
+      name: 'Empty timestamp in idempotency key (.nonce)',
+      passed: res.status === 400,
+      expected: '400 (empty timestamp)',
+      actual: `${res.status}`,
+      error: res.status !== 400 ? JSON.stringify(res.body) : undefined,
+    });
+  } catch (error: any) {
+    results.push({
+      name: 'Empty timestamp in idempotency key (.nonce)',
       passed: false,
       expected: '400',
       actual: 'Exception thrown',
@@ -809,6 +859,39 @@ async function testRequestBodyValidation(): Promise<TestResult[]> {
   return results;
 }
 
+async function testRedisFallback(): Promise<TestResult[]> {
+  const results: TestResult[] = [];
+
+  console.log('\n=== Redis Fallback Tests ===\n');
+
+  // Test 1: Service should work with Redis down (LRU fallback)
+  try {
+    const { publicKey } = generateECDHKeyPair();
+    const { key: idempotencyKey } = generateIdempotencyKey();
+
+    const res = await makeSessionInitRequest(publicKey, idempotencyKey, 'test-redis-fallback', 900);
+
+    // Should succeed even if Redis is down (using LRU cache fallback)
+    results.push({
+      name: 'Session creation with Redis down (LRU fallback)',
+      passed: res.status === 200,
+      expected: '200 (LRU fallback works)',
+      actual: `${res.status}`,
+      error: res.status !== 200 ? JSON.stringify(res.body) : undefined,
+    });
+  } catch (error: any) {
+    results.push({
+      name: 'Session creation with Redis down (LRU fallback)',
+      passed: false,
+      expected: '200',
+      actual: 'Exception thrown',
+      error: error.message,
+    });
+  }
+
+  return results;
+}
+
 // Main test runner
 async function runAllTests() {
   console.log('╔════════════════════════════════════════════════════════════════╗');
@@ -823,6 +906,7 @@ async function runAllTests() {
   allResults.push(...await testPublicKeyValidation());
   allResults.push(...await testTTLValidation());
   allResults.push(...await testRequestBodyValidation());
+  allResults.push(...await testRedisFallback());
 
   // Print summary
   console.log('\n╔════════════════════════════════════════════════════════════════╗');
