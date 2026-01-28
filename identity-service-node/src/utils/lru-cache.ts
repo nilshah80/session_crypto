@@ -156,17 +156,3 @@ export class LRUCache<T = any> {
     this.cache.clear();
   }
 }
-
-// Export singleton instances for different cache types
-
-/** Session cache - stores session data */
-export const sessionCache = new LRUCache({
-  maxSize: CACHE.SESSION_CACHE_MAX_SIZE,
-  defaultTtlMs: CACHE.SESSION_CACHE_TTL_MS,
-});
-
-/** Nonce cache - stores used nonces for replay protection */
-export const nonceCache = new LRUCache<boolean>({
-  maxSize: CACHE.NONCE_CACHE_MAX_SIZE,
-  defaultTtlMs: CACHE.NONCE_CACHE_TTL_MS,
-});

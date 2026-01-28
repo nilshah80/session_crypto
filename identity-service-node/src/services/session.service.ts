@@ -2,7 +2,7 @@ import { requestValidationService } from './request-validation.service';
 import { sessionStoreService } from './session-store.service';
 import { SessionInitBody, SessionInitResponse, SessionData } from '../types/session.types';
 import { config } from '../config';
-import { SESSION, CRYPTO } from '../constants';
+import { SESSION } from '../constants';
 import {
   createEcdhKeypair,
   validateP256PublicKey,
@@ -48,14 +48,20 @@ export class SessionService {
     // 4. Compute ECDH shared secret
     const sharedSecret = serverEcdh.computeSecret(clientPublicKeyBytes);
 
-    try {
-      // 5. Derive session key using HKDF
-      const salt = Buffer.from(CRYPTO.HKDF_SALT, 'utf8');
-      const info = Buffer.from(CRYPTO.HKDF_INFO, 'utf8');
-      const sessionKey = hkdf32(sharedSecret, salt, info);
+    // Declare sessionKey outside try block for proper cleanup on all error paths
+    let sessionKey: Buffer | undefined;
 
-      // 6. Generate session ID
+    try {
+      // 5. Generate session ID (needed for HKDF salt)
       const sessionId = generateSessionId('S');
+
+      // 6. Derive session key using HKDF
+      // Salt: sessionId provides per-session uniqueness
+      // Info: includes clientId for domain separation (matches server behavior)
+      // Format: SESSION|A256GCM|{clientId} (A256GCM is the JWE algorithm identifier)
+      const salt = Buffer.from(sessionId, 'utf8');
+      const info = Buffer.from(`SESSION|A256GCM|${clientId}`, 'utf8');
+      sessionKey = hkdf32(sharedSecret, salt, info);
 
       // 7. Validate and calculate TTL
       // Reject negative or non-integer TTL values (matches server behavior)
@@ -63,26 +69,24 @@ export class SessionService {
         throw new Error('TTL_INVALID');
       }
 
-      // Cap TTL between configured min and max (clamping behavior matches server)
+      // 8. Cap TTL between configured min and max
+      // NOTE: TTL clamping behavior - values outside [SESSION_TTL_MIN_SEC, SESSION_TTL_MAX_SEC]
+      // are silently clamped to the nearest boundary. TTL of 0 is clamped to SESSION_TTL_MIN_SEC.
       const requestedTtl = body.ttlSec ?? config.SESSION_TTL_DEFAULT_SEC;
       const ttlSec = Math.max(
         config.SESSION_TTL_MIN_SEC,
         Math.min(requestedTtl, config.SESSION_TTL_MAX_SEC)
       );
 
-      // 8. Create session data
+      // 9. Create session data
       const sessionData: SessionData = {
         key: b64(sessionKey),
         type: SESSION.TYPE_ECDH,
         clientId,
       };
 
-      // 9. Store session (expiration calculated in sessionStoreService from ttlSec)
+      // 10. Store session (expiration calculated in sessionStoreService from ttlSec)
       await sessionStoreService.storeSession(sessionId, sessionData, ttlSec);
-
-      // 10. Zeroize sensitive buffers
-      zeroizeBuffer(sharedSecret);
-      zeroizeBuffer(sessionKey);
 
       // 11. Return response
       return {
@@ -92,12 +96,17 @@ export class SessionService {
         expiresInSec: ttlSec,
       };
     } catch (error) {
-      // Ensure sensitive data is zeroized even on error
-      zeroizeBuffer(sharedSecret);
       logger.error('SessionService', 'Failed to create session', error, undefined, undefined, undefined, {
         clientId,
       });
       throw error;
+    } finally {
+      // SECURITY: Always zeroize sensitive buffers, even on error paths
+      // This matches the pattern used in server/src/index.ts for /transaction/purchase
+      zeroizeBuffer(sharedSecret);
+      if (sessionKey) {
+        zeroizeBuffer(sessionKey);
+      }
     }
   }
 

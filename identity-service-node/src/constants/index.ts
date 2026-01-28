@@ -38,18 +38,6 @@ export const CACHE = {
   /** LRU cache cleanup interval in milliseconds (60 seconds) */
   LRU_CLEANUP_INTERVAL_MS: 60000,
 
-  /** Session cache max size */
-  SESSION_CACHE_MAX_SIZE: 50000,
-
-  /** Session cache default TTL in milliseconds (15 minutes) */
-  SESSION_CACHE_TTL_MS: 900000,
-
-  /** Nonce cache max size */
-  NONCE_CACHE_MAX_SIZE: 10000,
-
-  /** Nonce cache default TTL in milliseconds (10 minutes) */
-  NONCE_CACHE_TTL_MS: 600000,
-
   /** Redis periodic reconnect interval in milliseconds (30 seconds) */
   REDIS_PERIODIC_RECONNECT_INTERVAL_MS: 30000,
 
@@ -89,12 +77,6 @@ export const CRYPTO = {
 
   /** AES-GCM auth tag length in bytes */
   AES_TAG_LENGTH: 16,
-
-  /** HKDF salt for session key derivation */
-  HKDF_SALT: 'session-key',
-
-  /** HKDF info for session key derivation */
-  HKDF_INFO: 'aes-256-gcm-key',
 
   /** Session ID length in bytes */
   SESSION_ID_LENGTH: 16,
