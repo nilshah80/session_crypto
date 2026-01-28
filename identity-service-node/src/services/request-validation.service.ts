@@ -26,7 +26,7 @@ export class RequestValidationService {
    *
    * Two-factor replay protection:
    * 1. Timestamp window check (±5 minutes by default)
-   * 2. Nonce uniqueness check
+   * 2. Nonce uniqueness check (atomic SET NX operation)
    *
    * @param timestamp Timestamp string (milliseconds since epoch)
    * @param nonce Unique nonce string (min 16 characters)
@@ -61,22 +61,22 @@ export class RequestValidationService {
     }
 
     // 3. Nonce uniqueness check (CRITICAL for replay protection)
+    // SECURITY: Use atomic SET NX operation to prevent race conditions
     const nonceKey = `${NONCE_PREFIX}${nonce}`;
 
     try {
-      // Use STRICT mode - throws if Redis unavailable
-      const exists = await cacheService.existsStrict(nonceKey);
+      // Atomic set-if-not-exists (STRICT mode - throws if Redis unavailable)
+      // This prevents race conditions where two requests with same nonce could both pass
+      const wasSet = await cacheService.setIfNotExistsStrict(nonceKey, true, this.nonceTtlSec);
 
-      if (exists) {
+      if (!wasSet) {
+        // Nonce already exists - replay attack detected
         logger.warn('RequestValidationService', 'Replay attack detected', undefined, undefined, undefined, undefined, {
           nonce,
           timestamp: ts,
         });
         throw new Error('REPLAY_DETECTED');
       }
-
-      // Store nonce with TTL (STRICT mode - throws if Redis unavailable)
-      await cacheService.setStrict(nonceKey, true, this.nonceTtlSec);
 
       logger.debug('RequestValidationService', 'Request validated', undefined, {
         timestamp: ts,

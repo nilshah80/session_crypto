@@ -42,6 +42,9 @@ export interface SessionData {
   /** Session type identifier */
   type: string;
 
+  /** Expiration timestamp (Unix milliseconds) - required for server compatibility */
+  expiresAt: number;
+
   /** Principal/user identifier (optional) */
   principal?: string;
 

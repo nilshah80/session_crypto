@@ -78,10 +78,12 @@ export class SessionService {
         Math.min(requestedTtl, config.SESSION_TTL_MAX_SEC)
       );
 
-      // 9. Create session data
+      // 9. Create session data with expiration
+      const expiresAt = Date.now() + ttlSec * 1000;
       const sessionData: SessionData = {
         key: b64(sessionKey),
         type: SESSION.TYPE_ECDH,
+        expiresAt,
         clientId,
       };
 

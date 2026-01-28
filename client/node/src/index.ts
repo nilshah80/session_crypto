@@ -10,6 +10,7 @@ import {
   buildAad,
 } from "./crypto-helpers.js";
 
+const SESSION_URL = process.env.SESSION_URL || "http://localhost:3001";
 const SERVER_URL = process.env.SERVER_URL || "http://localhost:3000";
 const CLIENT_REQUEST_TIMEOUT_MS = parseInt(process.env.CLIENT_REQUEST_TIMEOUT_MS || "5000", 10);
 
@@ -140,7 +141,7 @@ async function initSession(
 
   // Time HTTP request
   const httpStart = performance.now();
-  const response = await fetch(`${SERVER_URL}/session/init`, {
+  const response = await fetch(`${SESSION_URL}/v1/session/init`, {
     method: "POST",
     signal: AbortSignal.timeout(CLIENT_REQUEST_TIMEOUT_MS),
     headers: {

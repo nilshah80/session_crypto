@@ -141,6 +141,7 @@ export class SessionRepositoryImpl extends BaseRepositoryImpl implements Session
     const data: SessionData = {
       key: row.session_key,
       type: row.session_type,
+      expiresAt: row.expires_at.getTime(), // Convert Date to Unix timestamp
       clientId: row.client_id,
     };
 

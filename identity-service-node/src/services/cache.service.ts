@@ -8,6 +8,7 @@ export interface CacheService {
   get<T>(key: string): Promise<T | null>;
   set<T>(key: string, value: T, ttl: number): Promise<void>;
   setStrict<T>(key: string, value: T, ttl: number): Promise<void>;
+  setIfNotExistsStrict<T>(key: string, value: T, ttl: number): Promise<boolean>;
   delete(key: string): Promise<void>;
   exists(key: string): Promise<boolean>;
   existsStrict(key: string): Promise<boolean>;
@@ -231,6 +232,40 @@ class RedisCacheService implements CacheService {
       this.connected = false;
       this.tryReconnectAsync();
       logger.error('CacheService', `Cache set failed (strict mode): ${key}`, error as Error, undefined, undefined, undefined, {
+        key,
+        ttl,
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * Atomic set-if-not-exists operation (STRICT mode)
+   * CRITICAL for replay protection - prevents race conditions
+   * @param key Redis key
+   * @param value Value to set
+   * @param ttl TTL in seconds
+   * @returns true if value was set, false if key already existed
+   * @throws Error if Redis unavailable
+   */
+  async setIfNotExistsStrict<T>(key: string, value: T, ttl: number): Promise<boolean> {
+    if (!this.connected) {
+      this.tryReconnectAsync();
+      throw new Error('Redis unavailable for security-critical operation');
+    }
+
+    try {
+      const serialized = JSON.stringify(value);
+      // SET key value EX ttl NX - atomic operation
+      const result = await this.client.set(key, serialized, {
+        EX: ttl,
+        NX: true, // Only set if not exists
+      });
+      return result === 'OK';
+    } catch (error) {
+      this.connected = false;
+      this.tryReconnectAsync();
+      logger.error('CacheService', `Atomic set-if-not-exists failed: ${key}`, error as Error, undefined, undefined, undefined, {
         key,
         ttl,
       });
