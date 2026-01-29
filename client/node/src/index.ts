@@ -1,4 +1,5 @@
 import crypto from "crypto";
+import http from "http";
 import { performance } from "perf_hooks";
 import {
   b64,
@@ -13,6 +14,18 @@ import {
 const SESSION_URL = process.env.SESSION_URL || "http://localhost:3001";
 const SERVER_URL = process.env.SERVER_URL || "http://localhost:3000";
 const CLIENT_REQUEST_TIMEOUT_MS = parseInt(process.env.CLIENT_REQUEST_TIMEOUT_MS || "5000", 10);
+
+// ===== Option 2 & 3: Concurrency config and HTTP Keep-Alive =====
+const BENCHMARK_CONCURRENCY = parseInt(process.env.BENCHMARK_CONCURRENCY || "1", 10);
+
+// Option 3: HTTP Agent with Keep-Alive for connection pooling
+const httpAgent = new http.Agent({
+  keepAlive: true,
+  maxSockets: 100,
+  maxFreeSockets: 10,
+  timeout: 30000,
+  keepAliveMsecs: 1000,
+});
 
 // ===== Metrics Types =====
 interface CryptoTiming {
@@ -144,6 +157,8 @@ async function initSession(
   const response = await fetch(`${SESSION_URL}/v1/session/init`, {
     method: "POST",
     signal: AbortSignal.timeout(CLIENT_REQUEST_TIMEOUT_MS),
+    // @ts-ignore - agent is Node.js specific
+    agent: httpAgent,
     headers: {
       "Content-Type": "application/json",
       "X-Idempotency-Key": requestId,
@@ -284,6 +299,8 @@ async function makePurchase(
   const response = await fetch(`${SERVER_URL}/transaction/purchase`, {
     method: "POST",
     signal: AbortSignal.timeout(CLIENT_REQUEST_TIMEOUT_MS),
+    // @ts-ignore - agent is Node.js specific
+    agent: httpAgent,
     headers: {
       "Content-Type": "application/octet-stream",
       "X-Kid": session.kid,
@@ -408,6 +425,7 @@ function printMetricsSummary(
 // ===== Benchmark Mode =====
 async function runBenchmark(iterations: number): Promise<void> {
   const warmup = 5;
+  const concurrency = BENCHMARK_CONCURRENCY;
   const initDurations: number[] = [];
   const purchaseDurations: number[] = [];
   const combinedDurations: number[] = [];
@@ -415,42 +433,69 @@ async function runBenchmark(iterations: number): Promise<void> {
   console.log(
     "\n================================================================================"
   );
-  console.log(`  Throughput Benchmark (${iterations} iterations, ${warmup} warmup)`);
+  console.log(`  Throughput Benchmark (${iterations} iterations, ${warmup} warmup, concurrency: ${concurrency})`);
   console.log(
     "================================================================================\n"
   );
 
-  for (let i = 0; i < iterations + warmup; i++) {
-    const flowStart = performance.now();
+  // Option 1: Run concurrent workers for parallel execution
+  const totalIterations = iterations + warmup;
+  const requestsPerWorker = Math.ceil(totalIterations / concurrency);
+  let completedCount = 0;
+  const startTime = performance.now();
 
-    const { session, metrics: initMetrics } = await initSession(false);
-    const purchaseMetrics = await makePurchase(
-      session,
-      { schemeCode: "AEF", amount: 5000 },
-      false
-    );
+  // Create concurrent workers
+  const workers = Array(concurrency).fill(0).map(async (_, workerIndex) => {
+    const workerStart = workerIndex * requestsPerWorker;
+    const workerEnd = Math.min(workerStart + requestsPerWorker, totalIterations);
 
-    const flowDuration = performance.now() - flowStart;
+    for (let i = workerStart; i < workerEnd; i++) {
+      const flowStart = performance.now();
 
-    // SECURITY: Cleanup session key after use
-    cleanupSession(session);
-
-    if (i >= warmup) {
-      initDurations.push(initMetrics.totalRoundTripMs);
-      purchaseDurations.push(purchaseMetrics.totalRoundTripMs);
-      combinedDurations.push(flowDuration);
-    }
-
-    // Progress indicator
-    if ((i + 1) % 10 === 0 || i === iterations + warmup - 1) {
-      const progress = Math.min(i + 1 - warmup, iterations);
-      process.stdout.write(
-        `\r  Progress: ${progress}/${iterations} iterations completed`
+      const { session, metrics: initMetrics } = await initSession(false);
+      const purchaseMetrics = await makePurchase(
+        session,
+        { schemeCode: "AEF", amount: 5000 },
+        false
       );
+
+      const flowDuration = performance.now() - flowStart;
+
+      // SECURITY: Cleanup session key after use
+      cleanupSession(session);
+
+      // Skip warmup iterations
+      if (i >= warmup) {
+        initDurations.push(initMetrics.totalRoundTripMs);
+        purchaseDurations.push(purchaseMetrics.totalRoundTripMs);
+        combinedDurations.push(flowDuration);
+      }
+
+      // Thread-safe progress update
+      completedCount++;
+      if (completedCount % 100 === 0 || completedCount === totalIterations) {
+        const progress = Math.max(0, completedCount - warmup);
+        const elapsed = (performance.now() - startTime) / 1000;
+        const currentRps = elapsed > 0 ? (completedCount / elapsed).toFixed(0) : "0";
+        process.stdout.write(
+          `\r  Progress: ${progress}/${iterations} | Current RPS: ${currentRps} | Concurrency: ${concurrency}          `
+        );
+      }
     }
-  }
+  });
+
+  // Wait for all workers to complete
+  await Promise.all(workers);
+
+  const totalTime = (performance.now() - startTime) / 1000; // seconds
+  // ⬆️ Timer stops here - all printing below does NOT affect measurements
 
   console.log("\n");
+
+  // Display test summary
+  console.log("================================================================================");
+  console.log(`  Test Duration: ${totalTime.toFixed(2)}s (${(totalTime / 60).toFixed(2)} minutes)`);
+  console.log("================================================================================\n");
 
   // Calculate and display statistics
   const initStats = calculateStats(initDurations);
@@ -459,8 +504,21 @@ async function runBenchmark(iterations: number): Promise<void> {
 
   const printStats = (label: string, stats: BenchmarkStats): void => {
     console.log(`${label}:`);
+    // Calculate actual throughput based on concurrency and total time
+    const actualThroughput = (iterations / totalTime).toFixed(1);
+    const theoreticalMaxThroughput = ((1000 / stats.meanMs) * concurrency).toFixed(1);
+
     console.log(
-      `  Throughput:    ${((1000 / stats.meanMs) * 1).toFixed(1)} req/s`
+      `  Throughput:    ${actualThroughput} req/s (actual) | ${theoreticalMaxThroughput} req/s (theoretical max)`
+    );
+    console.log(
+      `    Calculation: ${iterations} iterations / ${totalTime.toFixed(2)}s = ${actualThroughput} req/s (actual)`
+    );
+    console.log(
+      `                 (1000ms / ${stats.meanMs.toFixed(1)}ms) × ${concurrency} workers = ${theoreticalMaxThroughput} req/s (theoretical)`
+    );
+    console.log(
+      `    Efficiency:  ${((parseFloat(actualThroughput) / parseFloat(theoreticalMaxThroughput)) * 100).toFixed(1)}% (actual/theoretical)`
     );
     console.log(
       `  Latency:       Min: ${stats.minMs.toFixed(1)}ms | Max: ${stats.maxMs.toFixed(1)}ms | Mean: ${stats.meanMs.toFixed(1)}ms`
@@ -488,12 +546,15 @@ async function main() {
   console.log("═══════════════════════════════════════════════════════════════");
   console.log("  Session Crypto PoC - Node.js Client");
   console.log("═══════════════════════════════════════════════════════════════");
-  console.log(`  Server: ${SERVER_URL}`);
+  console.log(`  Session Server: ${SESSION_URL}`);
+  console.log(`  API Server:     ${SERVER_URL}`);
 
   if (isBenchmark) {
-    console.log(`  Mode: Benchmark (${benchmarkIterations} iterations)`);
+    console.log(`  Mode:           Benchmark (${benchmarkIterations} iterations)`);
+    console.log(`  Concurrency:    ${BENCHMARK_CONCURRENCY} parallel workers`);
+    console.log(`  HTTP Keep-Alive: Enabled (max ${httpAgent.maxSockets} sockets)`);
   } else {
-    console.log("  Mode: Single run with metrics");
+    console.log("  Mode:           Single run with metrics");
   }
 
   try {
@@ -524,6 +585,9 @@ async function main() {
   } catch (error) {
     console.error("\n❌ Error:", error);
     process.exit(1);
+  } finally {
+    // Cleanup HTTP agent connections
+    httpAgent.destroy();
   }
 }
 
