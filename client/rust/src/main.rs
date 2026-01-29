@@ -7,10 +7,34 @@ use aws_lc_rs::{
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
 use std::env;
+use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::Mutex;
 use zeroize::Zeroize;
 
-const SERVER_URL: &str = "http://localhost:3000";
+// ===== Environment Config =====
+
+fn env_or_default(key: &str, fallback: &str) -> String {
+    env::var(key).unwrap_or_else(|_| fallback.to_string())
+}
+
+fn env_int_or_default(key: &str, fallback: usize) -> usize {
+    env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(fallback)
+}
+
+lazy_static::lazy_static! {
+    static ref SESSION_URL: String = env_or_default("SESSION_URL", "http://localhost:3001");
+    static ref SERVER_URL: String = env_or_default("SERVER_URL", "http://localhost:3000");
+}
+
+fn benchmark_concurrency() -> usize {
+    env_int_or_default("BENCHMARK_CONCURRENCY", 1)
+}
 
 // ===== Metrics Types =====
 
@@ -157,9 +181,33 @@ fn calculate_stats(durations: &[f64]) -> BenchmarkStats {
     }
 }
 
-fn print_benchmark_stats(label: &str, stats: &BenchmarkStats) {
+fn print_benchmark_stats(
+    label: &str,
+    stats: &BenchmarkStats,
+    iterations: usize,
+    concurrency: usize,
+    total_time: f64,
+) {
     println!("{}:", label);
-    println!("  Throughput:    {:.1} req/s", 1000.0 / stats.mean_ms);
+
+    // Calculate actual throughput based on concurrency and total time
+    let actual_throughput = iterations as f64 / total_time;
+    let theoretical_max_throughput = (1000.0 / stats.mean_ms) * concurrency as f64;
+    let efficiency = (actual_throughput / theoretical_max_throughput) * 100.0;
+
+    println!(
+        "  Throughput:    {:.1} req/s (actual) | {:.1} req/s (theoretical max)",
+        actual_throughput, theoretical_max_throughput
+    );
+    println!(
+        "    Calculation: {} iterations / {:.2}s = {:.1} req/s (actual)",
+        iterations, total_time, actual_throughput
+    );
+    println!(
+        "                 (1000ms / {:.1}ms) × {} workers = {:.1} req/s (theoretical)",
+        stats.mean_ms, concurrency, theoretical_max_throughput
+    );
+    println!("    Efficiency:  {:.1}% (actual/theoretical)", efficiency);
     println!(
         "  Latency:       Min: {:.1}ms | Max: {:.1}ms | Mean: {:.1}ms",
         stats.min_ms, stats.max_ms, stats.mean_ms
@@ -212,15 +260,23 @@ async fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(100);
 
+    let concurrency = benchmark_concurrency();
+
     println!("═══════════════════════════════════════════════════════════════");
     println!("  Session Crypto PoC - Rust Client");
     println!("═══════════════════════════════════════════════════════════════");
-    println!("  Server: {}", SERVER_URL);
+    println!("  Session Server:  {}", *SESSION_URL);
+    println!("  API Server:      {}", *SERVER_URL);
 
     if is_benchmark {
-        println!("  Mode: Benchmark ({} iterations)", benchmark_iterations);
+        println!(
+            "  Mode:            Benchmark ({} iterations)",
+            benchmark_iterations
+        );
+        println!("  Concurrency:     {} parallel workers", concurrency);
+        println!("  HTTP Keep-Alive: Enabled (connection pooling)");
     } else {
-        println!("  Mode: Single run with metrics");
+        println!("  Mode:            Single run with metrics");
     }
 
     let result = if is_benchmark {
@@ -266,64 +322,189 @@ async fn run_single() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run_benchmark(iterations: usize) -> Result<(), Box<dyn std::error::Error>> {
     const WARMUP: usize = 5;
-    let mut init_durations: Vec<f64> = Vec::with_capacity(iterations);
-    let mut purchase_durations: Vec<f64> = Vec::with_capacity(iterations);
-    let mut combined_durations: Vec<f64> = Vec::with_capacity(iterations);
+    let concurrency = benchmark_concurrency();
 
-    // Reuse a single client for all iterations
+    // Reuse a single client for all iterations (reqwest Client uses connection pooling)
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(10))
         .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(100)
         .build()?;
 
     println!("\n================================================================================");
     println!(
-        "  Throughput Benchmark ({} iterations, {} warmup)",
-        iterations, WARMUP
+        "  Throughput Benchmark ({} iterations, {} warmup, concurrency: {})",
+        iterations, WARMUP, concurrency
     );
     println!("================================================================================\n");
 
-    for i in 0..(iterations + WARMUP) {
-        let flow_start = Instant::now();
-
-        let (session, init_metrics) = init_session(&client, false).await?;
-        let purchase_metrics = make_purchase(
-            &client,
-            &session,
-            PurchaseRequest {
-                scheme_code: "AEF".to_string(),
-                amount: 5000,
-            },
-            false,
-        )
-        .await?;
-
-        let flow_duration = flow_start.elapsed().as_secs_f64() * 1000.0;
-
-        if i >= WARMUP {
-            init_durations.push(init_metrics.total_round_trip_ms);
-            purchase_durations.push(purchase_metrics.total_round_trip_ms);
-            combined_durations.push(flow_duration);
-        }
-
-        if (i + 1) % 10 == 0 || i == iterations + WARMUP - 1 {
-            let progress = if i >= WARMUP { i + 1 - WARMUP } else { 0 };
-            let progress = progress.min(iterations);
-            print!("\r  Progress: {}/{} iterations completed", progress, iterations);
-        }
+    // Thread-safe collection of results
+    struct IterationResult {
+        init_ms: f64,
+        purchase_ms: f64,
+        combined_ms: f64,
     }
+
+    let total_iterations = iterations + WARMUP;
+    let requests_per_worker = (total_iterations + concurrency - 1) / concurrency; // ceil div
+
+    let completed_count = Arc::new(AtomicU64::new(0));
+    let results = Arc::new(Mutex::new(Vec::<IterationResult>::new()));
+    let first_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+    let start_time = Instant::now();
+
+    // Create concurrent workers
+    let mut handles = Vec::new();
+    for w in 0..concurrency {
+        let worker_start = w * requests_per_worker;
+        let worker_end = (worker_start + requests_per_worker).min(total_iterations);
+        if worker_start >= total_iterations {
+            break;
+        }
+
+        let client = client.clone();
+        let completed_count = Arc::clone(&completed_count);
+        let results = Arc::clone(&results);
+        let first_err = Arc::clone(&first_err);
+
+        handles.push(tokio::spawn(async move {
+            for i in worker_start..worker_end {
+                // Check if another task errored
+                {
+                    let err = first_err.lock().await;
+                    if err.is_some() {
+                        return;
+                    }
+                }
+
+                let flow_start = Instant::now();
+
+                let init_result = init_session(&client, false)
+                    .await
+                    .map_err(|e| e.to_string());
+                let (session, init_metrics) = match init_result {
+                    Ok(v) => v,
+                    Err(msg) => {
+                        let mut err = first_err.lock().await;
+                        if err.is_none() {
+                            *err = Some(msg);
+                        }
+                        return;
+                    }
+                };
+
+                let purchase_result = make_purchase(
+                    &client,
+                    &session,
+                    PurchaseRequest {
+                        scheme_code: "AEF".to_string(),
+                        amount: 5000,
+                    },
+                    false,
+                )
+                .await
+                .map_err(|e| e.to_string());
+                let purchase_metrics = match purchase_result {
+                    Ok(v) => v,
+                    Err(msg) => {
+                        let mut err = first_err.lock().await;
+                        if err.is_none() {
+                            *err = Some(msg);
+                        }
+                        return;
+                    }
+                };
+
+                let flow_duration = flow_start.elapsed().as_secs_f64() * 1000.0;
+
+                // Skip warmup iterations
+                if i >= WARMUP {
+                    let mut res = results.lock().await;
+                    res.push(IterationResult {
+                        init_ms: init_metrics.total_round_trip_ms,
+                        purchase_ms: purchase_metrics.total_round_trip_ms,
+                        combined_ms: flow_duration,
+                    });
+                }
+
+                // Progress update
+                let completed = completed_count.fetch_add(1, Ordering::Relaxed) + 1;
+                if completed % 100 == 0 || completed == total_iterations as u64 {
+                    let progress = if completed > WARMUP as u64 {
+                        completed - WARMUP as u64
+                    } else {
+                        0
+                    };
+                    let elapsed = start_time.elapsed().as_secs_f64();
+                    let current_rps = if elapsed > 0.0 {
+                        completed as f64 / elapsed
+                    } else {
+                        0.0
+                    };
+                    print!(
+                        "\r  Progress: {}/{} | Current RPS: {:.0} | Concurrency: {}          ",
+                        progress, iterations, current_rps, concurrency
+                    );
+                    let _ = std::io::stdout().flush();
+                }
+            }
+        }));
+    }
+
+    // Wait for all workers to complete
+    for handle in handles {
+        handle.await?;
+    }
+
+    let total_time = start_time.elapsed().as_secs_f64();
+    // ⬆️ Timer stops here - all printing below does NOT affect measurements
+
+    // Check for errors
+    let err = first_err.lock().await;
+    if let Some(ref e) = *err {
+        return Err(e.clone().into());
+    }
+    drop(err);
 
     println!("\n");
 
-    print_benchmark_stats("/session/init", &calculate_stats(&init_durations));
+    // Display test summary
+    println!("================================================================================");
+    println!(
+        "  Test Duration: {:.2}s ({:.2} minutes)",
+        total_time,
+        total_time / 60.0
+    );
+    println!("================================================================================\n");
+
+    // Extract durations from results
+    let results = results.lock().await;
+    let init_durations: Vec<f64> = results.iter().map(|r| r.init_ms).collect();
+    let purchase_durations: Vec<f64> = results.iter().map(|r| r.purchase_ms).collect();
+    let combined_durations: Vec<f64> = results.iter().map(|r| r.combined_ms).collect();
+
+    print_benchmark_stats(
+        "/session/init",
+        &calculate_stats(&init_durations),
+        iterations,
+        concurrency,
+        total_time,
+    );
     print_benchmark_stats(
         "/transaction/purchase",
         &calculate_stats(&purchase_durations),
+        iterations,
+        concurrency,
+        total_time,
     );
     print_benchmark_stats(
         "Combined (init + purchase)",
         &calculate_stats(&combined_durations),
+        iterations,
+        concurrency,
+        total_time,
     );
 
     Ok(())
@@ -388,7 +569,7 @@ async fn init_session(
 
     let http_start = Instant::now();
     let response = client
-        .post(format!("{}/session/init", SERVER_URL))
+        .post(format!("{}/v1/session/init", *SESSION_URL))
         .header("Content-Type", "application/json")
         .header("X-Idempotency-Key", &request_id)
         .header("X-ClientId", CLIENT_ID)
@@ -574,7 +755,7 @@ async fn make_purchase(
 
     let http_start = Instant::now();
     let response = client
-        .post(format!("{}/transaction/purchase", SERVER_URL))
+        .post(format!("{}/transaction/purchase", *SERVER_URL))
         .header("Content-Type", "application/octet-stream")
         .header("X-Kid", &session.kid)
         .header("X-Idempotency-Key", &request_id)

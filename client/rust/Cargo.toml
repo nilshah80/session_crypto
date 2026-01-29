@@ -14,3 +14,4 @@ uuid = { version = "1.12", features = ["v4"] }
 aws-lc-rs = "1.12"
 rand = "0.8"
 zeroize = "1.8"
+lazy_static = "1.5"

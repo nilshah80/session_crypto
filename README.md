@@ -105,9 +105,13 @@ npm start
 # Node.js (benchmark mode with concurrency)
 BENCHMARK_CONCURRENCY=50 npm start -- --benchmark 10000
 
-# .NET
+# .NET (single run with metrics)
 cd client/dotnet/SessionCryptoClient
-dotnet run
+dotnet run -c Release
+
+# .NET (benchmark mode with concurrency)
+cd client/dotnet/SessionCryptoClient
+BENCHMARK_CONCURRENCY=50 dotnet run -c Release -- --benchmark 10000
 
 # Java (Virtual Threads)
 cd client/java-virtual-threads
@@ -117,13 +121,19 @@ cd client/java-virtual-threads
 cd client/java-webflux
 ./run.sh
 
-# Go
+# Go (single run with metrics)
 cd client/go
 go run .
 
-# Rust
+# Go (benchmark mode with concurrency)
+BENCHMARK_CONCURRENCY=50 go run . --benchmark 10000
+
+# Rust (single run with metrics)
 cd client/rust
-cargo run
+cargo run --release
+
+# Rust (benchmark mode with concurrency)
+BENCHMARK_CONCURRENCY=50 cargo run --release -- --benchmark 10000
 
 # Angular SPA (browser)
 cd client/angular-spa
@@ -329,7 +339,7 @@ cd client/go && go run .
 cd client/rust && cargo run --release
 cd client/java-virtual-threads && ./run.sh
 cd client/java-webflux && ./run.sh
-cd client/dotnet/SessionCryptoClient && dotnet run
+cd client/dotnet/SessionCryptoClient && dotnet run -c Release
 ```
 
 Example output:
@@ -370,17 +380,26 @@ BENCHMARK_CONCURRENCY=50 npm start -- --benchmark 10000
 # Node.js (stress test - maximum throughput)
 BENCHMARK_CONCURRENCY=100 npm start -- --benchmark 50000
 
-# Go
+# Go (sequential - latency measurement)
 go run . --benchmark 1000
 
-# Rust
+# Go (concurrent - high throughput)
+BENCHMARK_CONCURRENCY=50 go run . --benchmark 10000
+
+# Rust (sequential - latency measurement)
 cargo run --release -- --benchmark 1000
+
+# Rust (concurrent - high throughput)
+BENCHMARK_CONCURRENCY=50 cargo run --release -- --benchmark 10000
 
 # Java
 ./run.sh --benchmark 1000
 
-# .NET
-dotnet run -- --benchmark 1000
+# .NET (sequential - latency measurement)
+dotnet run -c Release -- --benchmark 1000
+
+# .NET (concurrent - high throughput)
+BENCHMARK_CONCURRENCY=50 dotnet run -c Release -- --benchmark 10000
 ```
 
 #### Node.js Client Concurrency Options
@@ -438,11 +457,163 @@ for CONC in 1 10 25 50 100; do
 done
 ```
 
+#### Go Client Concurrency Options
+
+The Go client supports concurrent goroutine workers for high-throughput benchmarking:
+
+**1. Concurrent Goroutine Workers** - Automatic parallel execution
+```bash
+# Default: 1 worker (sequential)
+go run . --benchmark 1000
+
+# 25 workers
+BENCHMARK_CONCURRENCY=25 go run . --benchmark 10000
+
+# 50 workers
+BENCHMARK_CONCURRENCY=50 go run . --benchmark 50000
+
+# 100 workers
+BENCHMARK_CONCURRENCY=100 go run . --benchmark 500000
+```
+
+**2. HTTP Keep-Alive** - Always enabled (Go default)
+- Connection pooling with max 100 connections per host
+- `MaxIdleConns`, `MaxConnsPerHost` tuned for high concurrency
+
+**3. Configuration Options**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BENCHMARK_CONCURRENCY` | 1 | Number of parallel goroutine workers |
+| `SESSION_URL` | http://localhost:3001 | Identity service URL |
+| `SERVER_URL` | http://localhost:3000 | API server URL |
+
+**Example Output:**
+```
+Throughput Benchmark (10000 iterations, 5 warmup, concurrency: 50)
+
+Progress: 10000/10000 | Current RPS: 4200 | Concurrency: 50
+
+Combined (init + purchase):
+  Throughput:    4150.3 req/s (actual) | 2100.5 req/s (theoretical max)
+  Latency:       Min: 15.2ms | Max: 78.4ms | Mean: 23.8ms
+                 P50: 22.1ms | P95: 33.5ms | P99: 50.2ms
+```
+
+#### Rust Client Concurrency Options
+
+The Rust client supports concurrent tokio task workers for high-throughput benchmarking:
+
+**1. Concurrent Tokio Workers** - Automatic parallel execution
+```bash
+# Default: 1 worker (sequential)
+cargo run --release -- --benchmark 1000
+
+# 25 workers
+BENCHMARK_CONCURRENCY=25 cargo run --release -- --benchmark 10000
+
+# 50 workers
+BENCHMARK_CONCURRENCY=50 cargo run --release -- --benchmark 50000
+
+# 100 workers
+BENCHMARK_CONCURRENCY=100 cargo run --release -- --benchmark 500000
+```
+
+**2. HTTP Keep-Alive** - Always enabled via reqwest connection pooling
+- `pool_max_idle_per_host(100)` for high concurrency
+- Automatic connection reuse across workers
+
+**3. Configuration Options**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BENCHMARK_CONCURRENCY` | 1 | Number of parallel tokio task workers |
+| `SESSION_URL` | http://localhost:3001 | Identity service URL |
+| `SERVER_URL` | http://localhost:3000 | API server URL |
+
+**Example Output:**
+```
+Throughput Benchmark (10000 iterations, 5 warmup, concurrency: 50)
+
+Progress: 10000/10000 | Current RPS: 4500 | Concurrency: 50
+
+Combined (init + purchase):
+  Throughput:    4480.1 req/s (actual) | 2250.3 req/s (theoretical max)
+  Latency:       Min: 14.8ms | Max: 72.1ms | Mean: 22.2ms
+                 P50: 20.5ms | P95: 31.8ms | P99: 48.7ms
+```
+
+#### .NET Client Concurrency Options
+
+The .NET client supports concurrent Task workers for high-throughput benchmarking:
+
+**1. Concurrent Task Workers** - Automatic parallel execution
+```bash
+# Default: 1 worker (sequential)
+dotnet run -c Release -- --benchmark 1000
+
+# 25 workers
+BENCHMARK_CONCURRENCY=25 dotnet run -c Release -- --benchmark 10000
+
+# 50 workers
+BENCHMARK_CONCURRENCY=50 dotnet run -c Release -- --benchmark 50000
+
+# 100 workers
+BENCHMARK_CONCURRENCY=100 dotnet run -c Release -- --benchmark 500000
+```
+
+**2. HTTP Keep-Alive** - Always enabled via SocketsHttpHandler
+- `MaxConnectionsPerServer = 100` for high concurrency
+- `PooledConnectionLifetime` and `PooledConnectionIdleTimeout` tuned
+
+**3. Configuration Options**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BENCHMARK_CONCURRENCY` | 1 | Number of parallel Task workers |
+| `SESSION_URL` | http://localhost:3001 | Identity service URL |
+| `SERVER_URL` | http://localhost:3000 | API server URL |
+
+**Example Output:**
+```
+Throughput Benchmark (10000 iterations, 5 warmup, concurrency: 50)
+
+Progress: 10000/10000 | Current RPS: 2800 | Concurrency: 50
+
+Combined (init + purchase):
+  Throughput:    2750.5 req/s (actual) | 1400.2 req/s (theoretical max)
+  Latency:       Min: 20.3ms | Max: 95.6ms | Mean: 35.7ms
+                 P50: 33.2ms | P95: 48.9ms | P99: 72.1ms
+```
+
+#### Finding Optimal Concurrency (All Clients)
+
+```bash
+# Test different concurrency levels for any client
+for CONC in 1 10 25 50 100; do
+  echo "=== Testing concurrency: $CONC ==="
+
+  # Node.js
+  BENCHMARK_CONCURRENCY=$CONC npm start -- --benchmark 5000
+
+  # Go
+  BENCHMARK_CONCURRENCY=$CONC go run . --benchmark 5000
+
+  # Rust
+  BENCHMARK_CONCURRENCY=$CONC cargo run --release -- --benchmark 5000
+
+  # .NET
+  BENCHMARK_CONCURRENCY=$CONC dotnet run -c Release -- --benchmark 5000
+
+  sleep 5
+done
+```
+
 ### Benchmark Results
 
 Results from comprehensive cross-platform testing: 6 servers × 6 clients, 1000 iterations × 5 runs each, Release/Production mode.
 
-**Note:** All results below use sequential execution (concurrency=1) for latency measurement. For throughput testing, use `BENCHMARK_CONCURRENCY` environment variable (Node.js client supports up to 100× higher throughput with concurrent workers).
+**Note:** All results below use sequential execution (concurrency=1) for latency measurement. For throughput testing, use `BENCHMARK_CONCURRENCY` environment variable (Node.js, Go, Rust, and .NET clients all support concurrent workers for higher throughput).
 
 #### Server Performance Matrix (Combined init + purchase throughput in req/s)
 
@@ -516,9 +687,10 @@ Results from comprehensive cross-platform testing: 6 servers × 6 clients, 1000 
 3. **Connection Pool Tuning** - Optimized pool sizes
 
 **Client Optimizations:**
-- **Go/Rust**: Native crypto, minimal overhead
+- **Go**: Native crypto, goroutine concurrent workers, HTTP keep-alive pooling
+- **Rust**: aws-lc-rs, tokio task concurrent workers, reqwest connection pooling
 - **Node.js**: HTTP keep-alive pooling, concurrent workers (up to 100×), cipher caching, buffer pooling
-- **.NET**: AesGcm reuse, ArrayPool, SocketsHttpHandler
+- **.NET**: AesGcm reuse, ArrayPool, SocketsHttpHandler, Task concurrent workers
 - **Java**: ACCP provider, Cipher instance reuse, ThreadLocal pools
 
 #### Running Comprehensive Benchmarks

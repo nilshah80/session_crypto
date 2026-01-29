@@ -12,24 +12,52 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
 	"golang.org/x/crypto/hkdf"
 )
 
-const serverURL = "http://localhost:3000"
+// ===== Environment Config =====
 
-// HTTP client with timeout and connection pooling
+func envOrDefault(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func envIntOrDefault(key string, fallback int) int {
+	if v := os.Getenv(key); v != "" {
+		n, err := strconv.Atoi(v)
+		if err == nil {
+			return n
+		}
+	}
+	return fallback
+}
+
+var (
+	sessionURL           = envOrDefault("SESSION_URL", "http://localhost:3001")
+	serverURL            = envOrDefault("SERVER_URL", "http://localhost:3000")
+	benchmarkConcurrency = envIntOrDefault("BENCHMARK_CONCURRENCY", 1)
+)
+
+// HTTP client with timeout and connection pooling (Keep-Alive enabled by default in Go)
 var httpClient = &http.Client{
 	Timeout: 30 * time.Second,
 	Transport: &http.Transport{
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 100,
+		MaxConnsPerHost:     100,
 		IdleConnTimeout:     90 * time.Second,
 	},
 }
@@ -156,9 +184,21 @@ func calculateStats(durations []float64) BenchmarkStats {
 	}
 }
 
-func printBenchmarkStats(label string, stats BenchmarkStats) {
+func printBenchmarkStats(label string, stats BenchmarkStats, iterations int, concurrency int, totalTime float64) {
 	fmt.Printf("%s:\n", label)
-	fmt.Printf("  Throughput:    %.1f req/s\n", 1000/stats.MeanMs)
+
+	// Calculate actual throughput based on concurrency and total time
+	actualThroughput := float64(iterations) / totalTime
+	theoreticalMaxThroughput := (1000 / stats.MeanMs) * float64(concurrency)
+	efficiency := (actualThroughput / theoreticalMaxThroughput) * 100
+
+	fmt.Printf("  Throughput:    %.1f req/s (actual) | %.1f req/s (theoretical max)\n",
+		actualThroughput, theoreticalMaxThroughput)
+	fmt.Printf("    Calculation: %d iterations / %.2fs = %.1f req/s (actual)\n",
+		iterations, totalTime, actualThroughput)
+	fmt.Printf("                 (1000ms / %.1fms) × %d workers = %.1f req/s (theoretical)\n",
+		stats.MeanMs, concurrency, theoreticalMaxThroughput)
+	fmt.Printf("    Efficiency:  %.1f%% (actual/theoretical)\n", efficiency)
 	fmt.Printf("  Latency:       Min: %.1fms | Max: %.1fms | Mean: %.1fms\n",
 		stats.MinMs, stats.MaxMs, stats.MeanMs)
 	fmt.Printf("                 P50: %.1fms | P95: %.1fms | P99: %.1fms\n",
@@ -201,16 +241,19 @@ func main() {
 	fmt.Println("═══════════════════════════════════════════════════════════════")
 	fmt.Println("  Session Crypto PoC - Go Client")
 	fmt.Println("═══════════════════════════════════════════════════════════════")
-	fmt.Printf("  Server: %s\n", serverURL)
+	fmt.Printf("  Session Server:  %s\n", sessionURL)
+	fmt.Printf("  API Server:      %s\n", serverURL)
 
 	if *benchmark > 0 {
-		fmt.Printf("  Mode: Benchmark (%d iterations)\n", *benchmark)
+		fmt.Printf("  Mode:            Benchmark (%d iterations)\n", *benchmark)
+		fmt.Printf("  Concurrency:     %d parallel workers\n", benchmarkConcurrency)
+		fmt.Printf("  HTTP Keep-Alive: Enabled (max %d connections)\n", 100)
 		if err := runBenchmark(*benchmark); err != nil {
 			fmt.Printf("\n❌ Error: %v\n", err)
 			os.Exit(1)
 		}
 	} else {
-		fmt.Println("  Mode: Single run with metrics")
+		fmt.Println("  Mode:            Single run with metrics")
 
 		session, initMetrics, err := initSession(true)
 		if err != nil {
@@ -238,57 +281,143 @@ func main() {
 
 func runBenchmark(iterations int) error {
 	const warmup = 5
-	initDurations := make([]float64, 0, iterations)
-	purchaseDurations := make([]float64, 0, iterations)
-	combinedDurations := make([]float64, 0, iterations)
+	concurrency := benchmarkConcurrency
 
 	fmt.Printf("\n================================================================================\n")
-	fmt.Printf("  Throughput Benchmark (%d iterations, %d warmup)\n", iterations, warmup)
+	fmt.Printf("  Throughput Benchmark (%d iterations, %d warmup, concurrency: %d)\n", iterations, warmup, concurrency)
 	fmt.Printf("================================================================================\n\n")
 
-	for i := 0; i < iterations+warmup; i++ {
-		flowStart := time.Now()
+	// Thread-safe collection of results
+	type iterationResult struct {
+		index       int
+		initMs      float64
+		purchaseMs  float64
+		combinedMs  float64
+	}
 
-		session, initMetrics, err := initSession(false)
-		if err != nil {
-			return err
+	totalIterations := iterations + warmup
+	requestsPerWorker := int(math.Ceil(float64(totalIterations) / float64(concurrency)))
+
+	var completedCount int64
+	var mu sync.Mutex
+	var results []iterationResult
+	var firstErr error
+
+	startTime := time.Now()
+
+	// Create concurrent workers
+	var wg sync.WaitGroup
+	for w := 0; w < concurrency; w++ {
+		workerStart := w * requestsPerWorker
+		workerEnd := workerStart + requestsPerWorker
+		if workerEnd > totalIterations {
+			workerEnd = totalIterations
+		}
+		if workerStart >= totalIterations {
+			break
 		}
 
-		purchaseMetrics, err := makePurchase(session, PurchaseRequest{SchemeCode: "AEF", Amount: 5000}, false)
-		if err != nil {
-			session.Close() // Clear session key before returning on error
-			return err
-		}
+		wg.Add(1)
+		go func(wStart, wEnd int) {
+			defer wg.Done()
+			for i := wStart; i < wEnd; i++ {
+				// Check if another goroutine errored
+				mu.Lock()
+				if firstErr != nil {
+					mu.Unlock()
+					return
+				}
+				mu.Unlock()
 
-		flowDuration := float64(time.Since(flowStart).Microseconds()) / 1000.0
+				flowStart := time.Now()
 
-		if i >= warmup {
-			initDurations = append(initDurations, initMetrics.TotalRoundTripMs)
-			purchaseDurations = append(purchaseDurations, purchaseMetrics.TotalRoundTripMs)
-			combinedDurations = append(combinedDurations, flowDuration)
-		}
+				session, initMetrics, err := initSession(false)
+				if err != nil {
+					mu.Lock()
+					if firstErr == nil {
+						firstErr = err
+					}
+					mu.Unlock()
+					return
+				}
 
-		// SECURITY: Clear session key at end of each iteration (not defer in loop!)
-		// Using defer inside loop accumulates all defers until function returns
-		session.Close()
+				purchaseMetrics, err := makePurchase(session, PurchaseRequest{SchemeCode: "AEF", Amount: 5000}, false)
+				if err != nil {
+					session.Close()
+					mu.Lock()
+					if firstErr == nil {
+						firstErr = err
+					}
+					mu.Unlock()
+					return
+				}
 
-		if (i+1)%10 == 0 || i == iterations+warmup-1 {
-			progress := i + 1 - warmup
-			if progress < 0 {
-				progress = 0
+				flowDuration := float64(time.Since(flowStart).Microseconds()) / 1000.0
+
+				// SECURITY: Clear session key after use
+				session.Close()
+
+				// Skip warmup iterations
+				if i >= warmup {
+					mu.Lock()
+					results = append(results, iterationResult{
+						index:      i,
+						initMs:     initMetrics.TotalRoundTripMs,
+						purchaseMs: purchaseMetrics.TotalRoundTripMs,
+						combinedMs: flowDuration,
+					})
+					mu.Unlock()
+				}
+
+				// Progress update
+				completed := atomic.AddInt64(&completedCount, 1)
+				if completed%100 == 0 || completed == int64(totalIterations) {
+					progress := completed - int64(warmup)
+					if progress < 0 {
+						progress = 0
+					}
+					elapsed := time.Since(startTime).Seconds()
+					currentRps := float64(0)
+					if elapsed > 0 {
+						currentRps = float64(completed) / elapsed
+					}
+					fmt.Printf("\r  Progress: %d/%d | Current RPS: %.0f | Concurrency: %d          ",
+						progress, iterations, currentRps, concurrency)
+				}
 			}
-			if progress > iterations {
-				progress = iterations
-			}
-			fmt.Printf("\r  Progress: %d/%d iterations completed", progress, iterations)
-		}
+		}(workerStart, workerEnd)
+	}
+
+	// Wait for all workers to complete
+	wg.Wait()
+
+	totalTime := time.Since(startTime).Seconds()
+	// ⬆️ Timer stops here - all printing below does NOT affect measurements
+
+	if firstErr != nil {
+		return firstErr
 	}
 
 	fmt.Println("\n")
 
-	printBenchmarkStats("/session/init", calculateStats(initDurations))
-	printBenchmarkStats("/transaction/purchase", calculateStats(purchaseDurations))
-	printBenchmarkStats("Combined (init + purchase)", calculateStats(combinedDurations))
+	// Display test summary
+	fmt.Println("================================================================================")
+	fmt.Printf("  Test Duration: %.2fs (%.2f minutes)\n", totalTime, totalTime/60)
+	fmt.Println("================================================================================\n")
+
+	// Extract durations from results
+	initDurations := make([]float64, 0, len(results))
+	purchaseDurations := make([]float64, 0, len(results))
+	combinedDurations := make([]float64, 0, len(results))
+	for _, r := range results {
+		initDurations = append(initDurations, r.initMs)
+		purchaseDurations = append(purchaseDurations, r.purchaseMs)
+		combinedDurations = append(combinedDurations, r.combinedMs)
+	}
+
+	printBenchmarkStats("/session/init", calculateStats(initDurations), iterations, concurrency, totalTime)
+	printBenchmarkStats("/transaction/purchase", calculateStats(purchaseDurations), iterations, concurrency, totalTime)
+	printBenchmarkStats("Combined (init + purchase)", calculateStats(combinedDurations), iterations, concurrency, totalTime)
 
 	return nil
 }
@@ -337,7 +466,7 @@ func initSession(verbose bool) (*SessionContext, *EndpointMetrics, error) {
 	}
 
 	reqJSON, _ := json.Marshal(reqBody)
-	req, _ := http.NewRequest("POST", serverURL+"/session/init", bytes.NewReader(reqJSON))
+	req, _ := http.NewRequest("POST", sessionURL+"/v1/session/init", bytes.NewReader(reqJSON))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Idempotency-Key", requestID)
 	req.Header.Set("X-ClientId", clientID)

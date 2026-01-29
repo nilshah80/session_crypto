@@ -6,7 +6,10 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
-const string ServerUrl = "http://localhost:3000";
+// ===== Environment Config =====
+var SessionUrl = Environment.GetEnvironmentVariable("SESSION_URL") ?? "http://localhost:3001";
+var ServerUrl = Environment.GetEnvironmentVariable("SERVER_URL") ?? "http://localhost:3000";
+var BenchmarkConcurrency = int.TryParse(Environment.GetEnvironmentVariable("BENCHMARK_CONCURRENCY"), out var bc) ? bc : 1;
 const string ClientId = "DOTNET_CLIENT_OPT";
 
 // Optimized HttpClient with SocketsHttpHandler for better connection pooling
@@ -34,9 +37,20 @@ var benchmarkIterations = isBenchmark && cliArgs.Length > benchmarkIdx + 1
 Console.WriteLine("═══════════════════════════════════════════════════════════════");
 Console.WriteLine("  Session Crypto PoC - .NET 10 Client (OPTIMIZED)");
 Console.WriteLine("═══════════════════════════════════════════════════════════════");
-Console.WriteLine($"  Server: {ServerUrl}");
-Console.WriteLine($"  Optimizations: AesGcm Reuse, ArrayPool, Span<T>, SocketsHttpHandler");
-Console.WriteLine($"  Mode: {(isBenchmark ? $"Benchmark ({benchmarkIterations} iterations)" : "Single run with metrics")}");
+Console.WriteLine($"  Session Server:  {SessionUrl}");
+Console.WriteLine($"  API Server:      {ServerUrl}");
+Console.WriteLine($"  Optimizations:   AesGcm Reuse, ArrayPool, Span<T>, SocketsHttpHandler");
+
+if (isBenchmark)
+{
+    Console.WriteLine($"  Mode:            Benchmark ({benchmarkIterations} iterations)");
+    Console.WriteLine($"  Concurrency:     {BenchmarkConcurrency} parallel workers");
+    Console.WriteLine($"  HTTP Keep-Alive: Enabled (max {socketsHandler.MaxConnectionsPerServer} connections)");
+}
+else
+{
+    Console.WriteLine("  Mode:            Single run with metrics");
+}
 
 try
 {
@@ -102,52 +116,114 @@ void PrewarmCrypto()
 async Task RunBenchmark(int iterations)
 {
     const int warmup = 5;
+    var concurrency = BenchmarkConcurrency;
+
+    Console.WriteLine($"\n================================================================================");
+    Console.WriteLine($"  Throughput Benchmark ({iterations} iterations, {warmup} warmup, concurrency: {concurrency})");
+    Console.WriteLine($"================================================================================\n");
+
+    // Thread-safe collection of results
+    var totalIterations = iterations + warmup;
+    var requestsPerWorker = (int)Math.Ceiling((double)totalIterations / concurrency);
+
+    long completedCount = 0;
+    var resultLock = new object();
     var initDurations = new List<double>();
     var purchaseDurations = new List<double>();
     var combinedDurations = new List<double>();
+    Exception? firstError = null;
 
-    Console.WriteLine($"\n================================================================================");
-    Console.WriteLine($"  Throughput Benchmark ({iterations} iterations, {warmup} warmup)");
-    Console.WriteLine($"================================================================================\n");
+    var startTime = Stopwatch.StartNew();
 
-    for (int i = 0; i < iterations + warmup; i++)
+    // Create concurrent workers
+    var workers = new List<Task>();
+    for (int w = 0; w < concurrency; w++)
     {
-        var flowSw = Stopwatch.StartNew();
+        var workerStart = w * requestsPerWorker;
+        var workerEnd = Math.Min(workerStart + requestsPerWorker, totalIterations);
+        if (workerStart >= totalIterations) break;
 
-        var (session, initMetrics) = await InitSession(verbose: false);
-        try
+        workers.Add(Task.Run(async () =>
         {
-            var purchaseMetrics = await MakePurchase(session, new PurchaseRequest("AEF", 5000), verbose: false);
-
-            flowSw.Stop();
-
-            if (i >= warmup)
+            for (int i = workerStart; i < workerEnd; i++)
             {
-                initDurations.Add(initMetrics.TotalRoundTripMs);
-                purchaseDurations.Add(purchaseMetrics.TotalRoundTripMs);
-                combinedDurations.Add(flowSw.Elapsed.TotalMilliseconds);
-            }
-        }
-        finally
-        {
-            // SECURITY: Ensure session keys are always zeroed, even on exception
-            session.Dispose();
-        }
+                // Check if another worker errored
+                lock (resultLock)
+                {
+                    if (firstError != null) return;
+                }
 
-        // Progress indicator
-        if ((i + 1) % 10 == 0 || i == iterations + warmup - 1)
-        {
-            var progress = Math.Min(i + 1 - warmup, iterations);
-            Console.Write($"\r  Progress: {progress}/{iterations} iterations completed");
-        }
+                var flowSw = Stopwatch.StartNew();
+
+                OptimizedSessionContext? session = null;
+                try
+                {
+                    var (sess, initMetrics) = await InitSession(verbose: false);
+                    session = sess;
+
+                    var purchaseMetrics = await MakePurchase(session, new PurchaseRequest("AEF", 5000), verbose: false);
+
+                    flowSw.Stop();
+
+                    // Skip warmup iterations
+                    if (i >= warmup)
+                    {
+                        lock (resultLock)
+                        {
+                            initDurations.Add(initMetrics.TotalRoundTripMs);
+                            purchaseDurations.Add(purchaseMetrics.TotalRoundTripMs);
+                            combinedDurations.Add(flowSw.Elapsed.TotalMilliseconds);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    lock (resultLock)
+                    {
+                        firstError ??= ex;
+                    }
+                    return;
+                }
+                finally
+                {
+                    // SECURITY: Ensure session keys are always zeroed
+                    session?.Dispose();
+                }
+
+                // Progress update
+                var completed = Interlocked.Increment(ref completedCount);
+                if (completed % 100 == 0 || completed == totalIterations)
+                {
+                    var progress = Math.Max(0, completed - warmup);
+                    var elapsed = startTime.Elapsed.TotalSeconds;
+                    var currentRps = elapsed > 0 ? completed / elapsed : 0;
+                    Console.Write($"\r  Progress: {progress}/{iterations} | Current RPS: {currentRps:F0} | Concurrency: {concurrency}          ");
+                }
+            }
+        }));
     }
+
+    // Wait for all workers to complete
+    await Task.WhenAll(workers);
+
+    startTime.Stop();
+    var totalTime = startTime.Elapsed.TotalSeconds;
+    // ⬆️ Timer stops here - all printing below does NOT affect measurements
+
+    if (firstError != null)
+        throw new Exception($"Benchmark failed: {firstError.Message}", firstError);
 
     Console.WriteLine("\n");
 
+    // Display test summary
+    Console.WriteLine("================================================================================");
+    Console.WriteLine($"  Test Duration: {totalTime:F2}s ({totalTime / 60:F2} minutes)");
+    Console.WriteLine("================================================================================\n");
+
     // Calculate and display statistics
-    PrintBenchmarkStats("/session/init", CalculateStats(initDurations));
-    PrintBenchmarkStats("/transaction/purchase", CalculateStats(purchaseDurations));
-    PrintBenchmarkStats("Combined (init + purchase)", CalculateStats(combinedDurations));
+    PrintBenchmarkStats("/session/init", CalculateStats(initDurations), iterations, concurrency, totalTime);
+    PrintBenchmarkStats("/transaction/purchase", CalculateStats(purchaseDurations), iterations, concurrency, totalTime);
+    PrintBenchmarkStats("Combined (init + purchase)", CalculateStats(combinedDurations), iterations, concurrency, totalTime);
 }
 
 BenchmarkStats CalculateStats(List<double> durations)
@@ -168,11 +244,19 @@ BenchmarkStats CalculateStats(List<double> durations)
     );
 }
 
-void PrintBenchmarkStats(string name, BenchmarkStats stats)
+void PrintBenchmarkStats(string name, BenchmarkStats stats, int iterations, int concurrency, double totalTime)
 {
-    var throughput = stats.Count / (stats.TotalMs / 1000.0);
     Console.WriteLine($"{name}:");
-    Console.WriteLine($"  Throughput:    {throughput:F1} req/s");
+
+    // Calculate actual throughput based on concurrency and total time
+    var actualThroughput = iterations / totalTime;
+    var theoreticalMaxThroughput = (1000.0 / stats.MeanMs) * concurrency;
+    var efficiency = (actualThroughput / theoreticalMaxThroughput) * 100.0;
+
+    Console.WriteLine($"  Throughput:    {actualThroughput:F1} req/s (actual) | {theoreticalMaxThroughput:F1} req/s (theoretical max)");
+    Console.WriteLine($"    Calculation: {iterations} iterations / {totalTime:F2}s = {actualThroughput:F1} req/s (actual)");
+    Console.WriteLine($"                 (1000ms / {stats.MeanMs:F1}ms) × {concurrency} workers = {theoreticalMaxThroughput:F1} req/s (theoretical)");
+    Console.WriteLine($"    Efficiency:  {efficiency:F1}% (actual/theoretical)");
     Console.WriteLine($"  Latency:       Min: {stats.MinMs:F1}ms | Max: {stats.MaxMs:F1}ms | Mean: {stats.MeanMs:F1}ms");
     Console.WriteLine($"                 P50: {stats.P50Ms:F1}ms | P95: {stats.P95Ms:F1}ms | P99: {stats.P99Ms:F1}ms\n");
 }
@@ -267,7 +351,7 @@ async Task<(OptimizedSessionContext Session, EndpointMetrics Metrics)> InitSessi
     }
 
     // Time HTTP request
-    var request = new HttpRequestMessage(HttpMethod.Post, $"{ServerUrl}/session/init")
+    var request = new HttpRequestMessage(HttpMethod.Post, $"{SessionUrl}/v1/session/init")
     {
         Content = new StringContent(JsonSerializer.Serialize(requestBody), Encoding.UTF8, "application/json")
     };
