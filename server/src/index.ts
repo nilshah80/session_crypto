@@ -1,6 +1,7 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import crypto from "crypto";
+import http from "http";
 import { Redis } from "ioredis";
 import {
   b64,
@@ -56,6 +57,79 @@ const REDIS_CONNECTION_TIMEOUT_MS = parseIntEnv("REDIS_CONNECTION_TIMEOUT_MS", 1
 const SESSION_TTL_MIN_SEC = parseIntEnv("SESSION_TTL_MIN_SEC", 300, 60);  // 5 minutes default, min 1 minute
 const SESSION_TTL_MAX_SEC = parseIntEnv("SESSION_TTL_MAX_SEC", 3600, 60); // 1 hour default, min 1 minute
 const SESSION_TTL_DEFAULT_SEC = parseIntEnv("SESSION_TTL_DEFAULT_SEC", 1800, 60); // 30 minutes default, min 1 minute
+
+// Identity Service configuration
+const IDENTITY_SERVICE_HOST = process.env.IDENTITY_SERVICE_HOST || "localhost";
+const IDENTITY_SERVICE_PORT = parseIntEnv("IDENTITY_SERVICE_PORT", 3001, 1, 65535);
+const IDENTITY_SERVICE_TIMEOUT_MS = parseIntEnv("IDENTITY_SERVICE_TIMEOUT_MS", 5000, 100, 30000);
+
+/**
+ * Response from identity-service GET /v1/session/:sessionId
+ */
+interface SessionKeyResponse {
+  sessionId: string;
+  sessionKey: string;
+  expiresAt: number;
+}
+
+/**
+ * Fetch session key from identity-service-node
+ * @param sessionId Session ID
+ * @param clientId Client ID for authorization
+ * @returns Session key as Buffer
+ */
+async function fetchSessionKeyFromIdentityService(
+  sessionId: string,
+  clientId: string
+): Promise<{ key: Buffer; expiresAt: number }> {
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: IDENTITY_SERVICE_HOST,
+      port: IDENTITY_SERVICE_PORT,
+      path: `/v1/session/${sessionId}`,
+      method: "GET",
+      headers: {
+        "X-ClientId": clientId,
+      },
+      timeout: IDENTITY_SERVICE_TIMEOUT_MS,
+    };
+
+    const req = http.request(options, (res) => {
+      let data = "";
+      res.on("data", (chunk) => { data += chunk; });
+      res.on("end", () => {
+        try {
+          if (res.statusCode === 200) {
+            const response: SessionKeyResponse = JSON.parse(data);
+            const keyBuffer = Buffer.from(response.sessionKey, "base64");
+            resolve({ key: keyBuffer, expiresAt: response.expiresAt });
+          } else if (res.statusCode === 404) {
+            reject(new Error("SESSION_NOT_FOUND"));
+          } else if (res.statusCode === 403) {
+            reject(new Error("SESSION_UNAUTHORIZED"));
+          } else if (res.statusCode === 410) {
+            reject(new Error("SESSION_EXPIRED"));
+          } else {
+            reject(new Error(`IDENTITY_SERVICE_ERROR: ${res.statusCode}`));
+          }
+        } catch (e) {
+          reject(new Error("IDENTITY_SERVICE_PARSE_ERROR"));
+        }
+      });
+    });
+
+    req.on("error", (err) => {
+      reject(new Error(`IDENTITY_SERVICE_UNAVAILABLE: ${err.message}`));
+    });
+
+    req.on("timeout", () => {
+      req.destroy();
+      reject(new Error("IDENTITY_SERVICE_TIMEOUT"));
+    });
+
+    req.end();
+  });
+}
 
 // Validate required environment variables
 function validateEnvironment(): void {
@@ -275,6 +349,7 @@ fastify.post<{
 });
 
 // POST /transaction/purchase - Encrypted business endpoint
+// Fetches session key from identity-service-node for decryption/encryption
 fastify.post("/transaction/purchase", async (request, reply) => {
   // Extract headers
   const kid = request.headers["x-kid"] as string | undefined;
@@ -308,12 +383,25 @@ fastify.post("/transaction/purchase", async (request, reply) => {
     return reply.status(400).send({ error: "CRYPTO_ERROR" });
   }
 
-  // Get session from Redis store
-  const session = await request.metrics!.measureAsync("redis-get", () =>
-    getSession(sessionId)
-  );
-  if (!session) {
-    return reply.status(401).send({ error: "SESSION_EXPIRED" });
+  // Fetch session key from identity-service-node
+  let sessionKey: Buffer;
+  try {
+    const session = await request.metrics!.measureAsync("identity-service-get", () =>
+      fetchSessionKeyFromIdentityService(sessionId, clientId)
+    );
+    sessionKey = session.key;
+  } catch (e) {
+    const error = e as Error;
+    request.log.warn({ error: error.message, sessionId }, "Failed to fetch session from identity-service");
+    
+    if (error.message === "SESSION_NOT_FOUND" || error.message === "SESSION_EXPIRED") {
+      return reply.status(401).send({ error: "SESSION_EXPIRED" });
+    }
+    if (error.message === "SESSION_UNAUTHORIZED") {
+      return reply.status(403).send({ error: "SESSION_UNAUTHORIZED" });
+    }
+    // Identity service unavailable or other errors
+    return reply.status(503).send({ error: "SERVICE_UNAVAILABLE" });
   }
 
   // SECURITY: Wrap all session key usage in try/finally to ensure zeroization on all paths
@@ -344,7 +432,7 @@ fastify.post("/transaction/purchase", async (request, reply) => {
     let plaintext: Buffer;
     try {
       plaintext = request.metrics!.measure("aes-gcm-decrypt", () =>
-        aesGcmDecrypt(session.key, aad, encryptedBody)
+        aesGcmDecrypt(sessionKey, aad, encryptedBody)
       );
     } catch (e) {
       request.log.warn({ error: e }, "Decryption failed");
@@ -391,7 +479,7 @@ fastify.post("/transaction/purchase", async (request, reply) => {
 
     // Encrypt - returns IV || ciphertext || tag
     const encryptedResponse = request.metrics!.measure("aes-gcm-encrypt", () =>
-      aesGcmEncrypt(session.key, responseAad, responsePlaintext)
+      aesGcmEncrypt(sessionKey, responseAad, responsePlaintext)
     );
 
     // Set response headers
@@ -402,7 +490,7 @@ fastify.post("/transaction/purchase", async (request, reply) => {
     return reply.send(encryptedResponse);
   } finally {
     // SECURITY: Always zeroize session key, even on error paths
-    session.key.fill(0);
+    sessionKey.fill(0);
   }
 });
 

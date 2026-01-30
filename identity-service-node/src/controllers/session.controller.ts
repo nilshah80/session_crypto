@@ -150,3 +150,78 @@ export async function initSession(
     });
   }
 }
+
+/**
+ * GET /v1/session/:sessionId - Get session key by session ID
+ * Requires X-ClientId header for authorization
+ * No replay protection check - handled during decryption
+ */
+export async function getSessionKey(
+  request: FastifyRequest<{ Params: { sessionId: string } }>,
+  reply: FastifyReply
+): Promise<void> {
+  try {
+    const { sessionId } = request.params;
+    const clientId = request.headers['x-clientid'] as string | undefined;
+
+    // Validate required header
+    if (!clientId) {
+      logger.warn('SessionController', 'Missing X-ClientId header for get session');
+      reply.code(400).send({
+        error: 'Bad Request',
+        message: 'X-ClientId header is required',
+      });
+      return;
+    }
+
+    // Validate sessionId format (S-{32-hex-chars})
+    if (!sessionId || !/^S-[a-f0-9]{32}$/.test(sessionId)) {
+      logger.warn('SessionController', 'Invalid session ID format', undefined, undefined, undefined, undefined, {
+        sessionId,
+      });
+      reply.code(400).send({
+        error: 'Bad Request',
+        message: 'Invalid session ID format',
+      });
+      return;
+    }
+
+    // Get session key
+    const response = await sessionService.getSessionKeyForClient(sessionId, clientId);
+
+    reply.code(200).send(response);
+  } catch (error) {
+    const err = error as Error;
+
+    if (err.message === 'SESSION_NOT_FOUND') {
+      reply.code(404).send({
+        error: 'Not Found',
+        message: 'Session not found',
+      });
+      return;
+    }
+
+    if (err.message === 'SESSION_UNAUTHORIZED') {
+      reply.code(403).send({
+        error: 'Forbidden',
+        message: 'Not authorized to access this session',
+      });
+      return;
+    }
+
+    if (err.message === 'SESSION_EXPIRED') {
+      reply.code(410).send({
+        error: 'Gone',
+        message: 'Session has expired',
+      });
+      return;
+    }
+
+    // Generic error handling
+    logger.error('SessionController', 'Get session key failed', err);
+    reply.code(500).send({
+      error: 'Internal Server Error',
+      message: 'Failed to get session key',
+    });
+  }
+}

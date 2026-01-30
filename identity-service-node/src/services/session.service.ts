@@ -1,6 +1,6 @@
 import { requestValidationService } from './request-validation.service';
 import { sessionStoreService } from './session-store.service';
-import { SessionInitBody, SessionInitResponse, SessionData } from '../types/session.types';
+import { SessionInitBody, SessionInitResponse, SessionData, SessionKeyResponse } from '../types/session.types';
 import { config } from '../config';
 import { SESSION } from '../constants';
 import {
@@ -128,6 +128,50 @@ export class SessionService {
    */
   async deleteSession(sessionId: string): Promise<boolean> {
     return await sessionStoreService.deleteSession(sessionId);
+  }
+
+  /**
+   * Get session key for a specific client (with authorization check)
+   * @param sessionId Session identifier
+   * @param clientId Client identifier (for authorization)
+   * @returns Session key response
+   * @throws Error if session not found or client not authorized
+   */
+  async getSessionKeyForClient(sessionId: string, clientId: string): Promise<SessionKeyResponse> {
+    const session = await sessionStoreService.getSession(sessionId);
+
+    if (!session) {
+      logger.warn('SessionService', 'Session not found', undefined, undefined, undefined, undefined, {
+        sessionId,
+        clientId,
+      });
+      throw new Error('SESSION_NOT_FOUND');
+    }
+
+    // Authorization check: verify client owns this session
+    if (session.clientId !== clientId) {
+      logger.warn('SessionService', 'Unauthorized session access attempt', undefined, undefined, undefined, undefined, {
+        sessionId,
+        requestingClientId: clientId,
+        sessionClientId: session.clientId,
+      });
+      throw new Error('SESSION_UNAUTHORIZED');
+    }
+
+    // Check if session has expired
+    if (session.expiresAt < Date.now()) {
+      logger.warn('SessionService', 'Session expired', undefined, undefined, undefined, undefined, {
+        sessionId,
+        expiresAt: session.expiresAt,
+      });
+      throw new Error('SESSION_EXPIRED');
+    }
+
+    return {
+      sessionId,
+      sessionKey: session.key,
+      expiresAt: session.expiresAt,
+    };
   }
 }
 

@@ -1,10 +1,11 @@
 /**
- * Positive Test Suite for /v1/session/init endpoint
+ * Positive Test Suite for Identity Service Node
  *
  * Test Categories:
- * - Valid session creation
+ * - Valid session creation (/v1/session/init)
  * - TTL variations
  * - Response validation
+ * - Get session key (/v1/session/:sessionId)
  */
 
 import * as crypto from 'crypto';
@@ -91,17 +92,71 @@ async function makeSessionInitRequest(
   });
 }
 
-// Test runner
-const results: TestResult[] = [];
+async function makeGetSessionRequest(
+  sessionId: string,
+  clientId: string
+): Promise<{ status: number; body: any; headers: any }> {
+  const options = {
+    hostname: BASE_URL,
+    port: PORT,
+    path: `/v1/session/${sessionId}`,
+    method: 'GET',
+    headers: {
+      'X-ClientId': clientId,
+    },
+  };
 
-function printResults() {
+  return new Promise((resolve, reject) => {
+    const req = http.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try {
+          resolve({
+            status: res.statusCode || 500,
+            body: JSON.parse(data),
+            headers: res.headers,
+          });
+        } catch (e) {
+          resolve({
+            status: res.statusCode || 500,
+            body: data,
+            headers: res.headers,
+          });
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+// Test runner
+function printResults(sessionInitResults: TestResult[], getSessionResults: TestResult[]) {
   console.log('\n╔════════════════════════════════════════════════════════════════╗');
-  console.log('║   Positive Test Suite for /v1/session/init Endpoint           ║');
+  console.log('║   Positive Test Suite for Identity Service Node               ║');
   console.log('╚════════════════════════════════════════════════════════════════╝\n');
 
   console.log('=== Valid Session Creation Tests ===\n');
 
-  results.forEach((result) => {
+  sessionInitResults.forEach((result) => {
+    const status = result.passed ? '✓' : '✗';
+    const color = result.passed ? '\x1b[32m' : '\x1b[31m';
+    const reset = '\x1b[0m';
+    console.log(`${color}${status}${reset} ${result.name}`);
+    if (!result.passed) {
+      console.log(`  Expected: ${result.expected}`);
+      console.log(`  Actual: ${result.actual}`);
+      if (result.error) {
+        console.log(`  Error: ${result.error}`);
+      }
+    }
+  });
+
+  console.log('\n=== Get Session Key Tests ===\n');
+
+  getSessionResults.forEach((result) => {
     const status = result.passed ? '✓' : '✗';
     const color = result.passed ? '\x1b[32m' : '\x1b[31m';
     const reset = '\x1b[0m';
@@ -119,9 +174,10 @@ function printResults() {
   console.log('║                         TEST SUMMARY                           ║');
   console.log('╚════════════════════════════════════════════════════════════════╝\n');
 
-  const passed = results.filter(r => r.passed).length;
-  const failed = results.filter(r => !r.passed).length;
-  const total = results.length;
+  const allResults = [...sessionInitResults, ...getSessionResults];
+  const passed = allResults.filter(r => r.passed).length;
+  const failed = allResults.filter(r => !r.passed).length;
+  const total = allResults.length;
   const successRate = ((passed / total) * 100).toFixed(1);
 
   console.log(`Total Tests:  ${total}`);
@@ -132,8 +188,9 @@ function printResults() {
   process.exit(failed > 0 ? 1 : 0);
 }
 
-// Tests
-async function runTests() {
+// Session Init Tests
+async function runSessionInitTests(): Promise<TestResult[]> {
+  const results: TestResult[] = [];
   // Test 1: Valid session creation with default TTL
   try {
     const { publicKey } = generateECDHKeyPair();
@@ -357,7 +414,157 @@ async function runTests() {
     });
   }
 
-  printResults();
+  return results;
+}
+
+// Get Session Key Tests
+async function runGetSessionTests(): Promise<TestResult[]> {
+  const results: TestResult[] = [];
+
+  // Test 1: Get session key after creating session
+  try {
+    const { publicKey } = generateECDHKeyPair();
+    const { key } = generateIdempotencyKey();
+    const clientId = 'test-get-session-1';
+
+    // Create session first
+    const createRes = await makeSessionInitRequest(publicKey, key, clientId);
+    if (createRes.status !== 200) {
+      throw new Error(`Failed to create session: ${createRes.status}`);
+    }
+
+    // Get session key
+    const getRes = await makeGetSessionRequest(createRes.body.sessionId, clientId);
+
+    const passed = getRes.status === 200 &&
+                   getRes.body.sessionId === createRes.body.sessionId &&
+                   getRes.body.sessionKey &&
+                   getRes.body.expiresAt > Date.now();
+
+    results.push({
+      name: 'Get session key after creating session',
+      passed,
+      expected: '200 with sessionId, sessionKey, expiresAt',
+      actual: `${getRes.status} with ${JSON.stringify(getRes.body)}`,
+    });
+  } catch (error) {
+    results.push({
+      name: 'Get session key after creating session',
+      passed: false,
+      expected: '200 OK',
+      actual: 'Request failed',
+      error: (error as Error).message,
+    });
+  }
+
+  // Test 2: Verify session key is valid base64
+  try {
+    const { publicKey } = generateECDHKeyPair();
+    const { key } = generateIdempotencyKey();
+    const clientId = 'test-get-session-2';
+
+    const createRes = await makeSessionInitRequest(publicKey, key, clientId);
+    const getRes = await makeGetSessionRequest(createRes.body.sessionId, clientId);
+
+    let isValidBase64 = false;
+    try {
+      const keyBuffer = Buffer.from(getRes.body.sessionKey, 'base64');
+      isValidBase64 = keyBuffer.length === 32; // AES-256 key
+    } catch (e) {
+      isValidBase64 = false;
+    }
+
+    results.push({
+      name: 'Session key is valid base64 (32 bytes for AES-256)',
+      passed: getRes.status === 200 && isValidBase64,
+      expected: 'Valid base64-encoded 32-byte key',
+      actual: isValidBase64 ? 'Valid 32-byte key' : 'Invalid key format',
+    });
+  } catch (error) {
+    results.push({
+      name: 'Session key is valid base64 (32 bytes for AES-256)',
+      passed: false,
+      expected: 'Valid key',
+      actual: 'Request failed',
+      error: (error as Error).message,
+    });
+  }
+
+  // Test 3: Verify expiresAt is in the future
+  try {
+    const { publicKey } = generateECDHKeyPair();
+    const { key } = generateIdempotencyKey();
+    const clientId = 'test-get-session-3';
+
+    const createRes = await makeSessionInitRequest(publicKey, key, clientId, 900);
+    const getRes = await makeGetSessionRequest(createRes.body.sessionId, clientId);
+
+    const now = Date.now();
+    const expiresAt = getRes.body.expiresAt;
+    const ttlRemaining = Math.floor((expiresAt - now) / 1000);
+
+    // Should have roughly 900 seconds remaining (allowing some tolerance)
+    const passed = getRes.status === 200 &&
+                   expiresAt > now &&
+                   ttlRemaining > 890 && ttlRemaining <= 900;
+
+    results.push({
+      name: 'ExpiresAt is in the future (matches TTL)',
+      passed,
+      expected: 'expiresAt ~900 seconds from now',
+      actual: `TTL remaining: ${ttlRemaining}s`,
+    });
+  } catch (error) {
+    results.push({
+      name: 'ExpiresAt is in the future (matches TTL)',
+      passed: false,
+      expected: 'Valid expiresAt',
+      actual: 'Request failed',
+      error: (error as Error).message,
+    });
+  }
+
+  // Test 4: Same client can retrieve session multiple times
+  try {
+    const { publicKey } = generateECDHKeyPair();
+    const { key } = generateIdempotencyKey();
+    const clientId = 'test-get-session-4';
+
+    const createRes = await makeSessionInitRequest(publicKey, key, clientId);
+    const sessionId = createRes.body.sessionId;
+
+    // Get session multiple times
+    const getRes1 = await makeGetSessionRequest(sessionId, clientId);
+    const getRes2 = await makeGetSessionRequest(sessionId, clientId);
+
+    const passed = getRes1.status === 200 &&
+                   getRes2.status === 200 &&
+                   getRes1.body.sessionKey === getRes2.body.sessionKey;
+
+    results.push({
+      name: 'Same client can retrieve session multiple times',
+      passed,
+      expected: 'Both requests return 200 with same sessionKey',
+      actual: `First: ${getRes1.status}, Second: ${getRes2.status}, Keys match: ${getRes1.body.sessionKey === getRes2.body.sessionKey}`,
+    });
+  } catch (error) {
+    results.push({
+      name: 'Same client can retrieve session multiple times',
+      passed: false,
+      expected: 'Both 200 OK',
+      actual: 'Request failed',
+      error: (error as Error).message,
+    });
+  }
+
+  return results;
+}
+
+// Main test runner
+async function runTests() {
+  const sessionInitResults = await runSessionInitTests();
+  const getSessionResults = await runGetSessionTests();
+  printResults(sessionInitResults, getSessionResults);
 }
 
 // Run all tests

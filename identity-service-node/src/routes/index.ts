@@ -1,6 +1,6 @@
 import { FastifyInstance } from 'fastify';
 import { healthCheck, readinessCheck } from '../controllers/health.controller';
-import { initSession } from '../controllers/session.controller';
+import { initSession, getSessionKey } from '../controllers/session.controller';
 
 /**
  * API version prefix
@@ -21,6 +21,10 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
       // Session initialization endpoint (public - no authentication middleware)
       // Authentication handled via APIM subscription key
       api.post('/session/init', initSession);
+
+      // Get session key endpoint
+      // No replay protection - handled during decryption
+      api.get('/session/:sessionId', getSessionKey);
     },
     { prefix: API_VERSION }
   );

@@ -611,101 +611,63 @@ done
 
 ### Benchmark Results
 
-Results from comprehensive cross-platform testing: 6 servers × 6 clients, 1000 iterations × 5 runs each, Release/Production mode.
+Results from concurrent benchmark testing: 10,000 iterations, 10 concurrent workers, Node.js server (Fastify) + identity-service-node.
 
-**Note:** All results below use sequential execution (concurrency=1) for latency measurement. For throughput testing, use `BENCHMARK_CONCURRENCY` environment variable (Node.js, Go, Rust, and .NET clients all support concurrent workers for higher throughput).
+**Test Configuration:**
+- **Iterations:** 10,000 per client
+- **Concurrency:** 10 parallel workers
+- **Server:** Node.js (Fastify) on port 3000 + identity-service-node on port 3001
+- **Infrastructure:** PostgreSQL 18 + Redis 8.0 (Docker)
+- **Environment:** macOS, localhost
 
-#### Server Performance Matrix (Combined init + purchase throughput in req/s)
+#### Client Performance Comparison
 
-| Client \ Server | .NET | Node.js | Go | Rust (aws-lc-rs) | Rust-ring | Rust-native |
-|-----------------|------|---------|-----|------------------|-----------|-------------|
-| **Go** | ~525 | ~1133 | ~1285 | **~1505** | ~1478 | ~929 |
-| **Rust** | ~555 | ~1083 | ~1290 | ~1482 | **~1502** | ~938 |
-| **Node.js** | ~290 | ~645 | ~655 | ~873 | **~901** | ~620 |
-| **.NET** | ~345 | ~585 | ~574 | ~682 | **~698** | ~558 |
-| **Java VT** | ~286 | ~417 | ~403 | **~484** | ~458 | ~347 |
-| **Java WebFlux** | ~269 | ~427 | ~390 | **~480** | ~459 | ~344 |
+| Client | Combined RPS | Mean Latency | P50 | P95 | P99 | Max | Duration |
+|--------|-------------|-------------|-----|-----|-----|-----|----------|
+| **Go** | **3062 req/s** | 3.2ms | 3.1ms | 4.4ms | 5.6ms | 23.7ms | 3.27s |
+| **Rust** | **3045 req/s** | 3.3ms | 3.1ms | 4.4ms | 5.7ms | 56.5ms | 3.28s |
+| **.NET** | **2476 req/s** | 4.0ms | 3.6ms | 5.2ms | 10.4ms | 94.4ms | 4.04s |
+| **Node.js** | **2362 req/s** | 4.2ms | 3.9ms | 6.1ms | 10.6ms | 63.8ms | 4.23s |
 
-#### Server Performance Rankings
+#### Endpoint Breakdown
 
-| Rank | Server | Peak Throughput | Crypto Library | Notes |
-|------|--------|-----------------|----------------|-------|
-| 🥇 1 | **Rust (aws-lc-rs)** | **1505 req/s** | aws-lc-rs | AWS LibCrypto, hardware-accelerated |
-| 🥈 2 | **Rust-ring** | **1502 req/s** | ring | BoringSSL-derived, excellent performance |
-| 🥉 3 | **Go** | **1290 req/s** | crypto/ecdh | Standard library, very efficient |
-| 4 | **Node.js** | **1133 req/s** | Node crypto | OpenSSL bindings, good performance |
-| 5 | **Rust-native** | **938 req/s** | RustCrypto | Pure Rust, no hardware acceleration |
-| 6 | **.NET** | **555 req/s** | System.Security | Framework overhead, room for improvement |
+**`/session/init` (ECDH key exchange + session creation)**
 
-#### Client Performance Rankings
+| Client | RPS | Mean | P50 | P95 | P99 |
+|--------|-----|------|-----|-----|-----|
+| **Go** | 3062 | 2.7ms | 2.6ms | 3.7ms | 4.8ms |
+| **Rust** | 3045 | 2.7ms | 2.5ms | 3.8ms | 4.9ms |
+| **.NET** | 2476 | 3.3ms | 3.0ms | 4.3ms | 8.2ms |
+| **Node.js** | 2362 | 3.1ms | 2.8ms | 4.4ms | 7.9ms |
 
-| Rank | Client | Best Throughput | Notes |
-|------|--------|-----------------|-------|
-| 🥇 1 | **Go** | **1505 req/s** | Excellent HTTP client, native crypto |
-| 🥈 2 | **Rust** | **1502 req/s** | Tokio async runtime, aws-lc-rs |
-| 🥉 3 | **Node.js** | **901 req/s** | Async I/O, OpenSSL bindings (up to ~7,600 RPS with concurrency=100) |
-| 4 | **.NET** | **698 req/s** | HttpClient with connection pooling |
-| 5 | **Java VT** | **484 req/s** | Virtual threads, JCA crypto |
-| 6 | **Java WebFlux** | **480 req/s** | Project Reactor, JCA crypto |
+**`/transaction/purchase` (AES-256-GCM encrypt/decrypt)**
+
+| Client | RPS | Mean | P50 | P95 | P99 |
+|--------|-----|------|-----|-----|-----|
+| **Go** | 3062 | 0.6ms | 0.5ms | 0.8ms | 1.3ms |
+| **Rust** | 3045 | 0.6ms | 0.5ms | 0.8ms | 1.3ms |
+| **.NET** | 2476 | 0.7ms | 0.6ms | 1.0ms | 2.4ms |
+| **Node.js** | 2362 | 1.1ms | 1.0ms | 2.2ms | 3.4ms |
+
+#### Client Rankings
+
+| Rank | Client | Throughput | Notes |
+|------|--------|-----------|-------|
+| 1 | **Go** | **3062 req/s** | Goroutine workers, native crypto, lowest tail latency |
+| 2 | **Rust** | **3045 req/s** | Tokio async, aws-lc-rs, near-identical to Go |
+| 3 | **.NET** | **2476 req/s** | AesGcm reuse, ArrayPool, SocketsHttpHandler |
+| 4 | **Node.js** | **2362 req/s** | Async I/O, OpenSSL bindings, highest tail latency |
 
 #### Key Insights
 
-**Best Combinations:**
-- 🏆 **Go/Rust client + Rust (aws-lc-rs) server** → **~1500+ req/s**
-- **Go/Rust client + Go server** → **~1285-1290 req/s**
-- **Node.js client + Rust servers** → **~900 req/s**
-
-**Performance Analysis:**
-- **Rust-native vs aws-lc-rs**: Pure RustCrypto is ~35% slower due to lack of hardware acceleration (AES-NI, CLMUL)
-- **.NET server**: Lowest throughput, likely due to ASP.NET Core middleware overhead
-- **Java clients**: Bottlenecked by JVM crypto operations; ACCP can improve this significantly
-- **Go**: Consistently excellent performance with minimal optimization needed
-
-#### Optimization Techniques
-
-**Rust Servers:**
-1. **aws-lc-rs / ring** - Hardware-accelerated AES-GCM and ECDH
-2. **Tokio runtime** - Efficient async I/O
-3. **Connection pooling** - Redis and PostgreSQL with timeouts
-4. **Zeroization** - Secure memory handling with `zeroize` crate
-
-**Go Server:**
-1. **crypto/ecdh** - Native P-256 support
-2. **Connection pooling** - Optimized Redis/PostgreSQL pools
-3. **Timeouts** - Read/Write/Idle timeouts on HTTP server
-4. **clearBytes()** - Secure memory clearing
-
-**Node.js Server:**
-1. **Cipher Instance Cache** - Reuse AES-GCM cipher instances
-2. **Buffer Pool for IV** - Pre-allocated IV buffers
-3. **Pre-allocated Result Buffers** - Avoid Buffer.concat() overhead
-4. **Automatic Cache Cleanup** - TTL-based eviction
-
-**.NET Server:**
-1. **AesGcm Instance Cache** - ConcurrentDictionary with cleanup
-2. **ArrayPool<byte>** - All buffer allocations from pool
-3. **Connection Pool Tuning** - Optimized pool sizes
-
-**Client Optimizations:**
-- **Go**: Native crypto, goroutine concurrent workers, HTTP keep-alive pooling
-- **Rust**: aws-lc-rs, tokio task concurrent workers, reqwest connection pooling
-- **Node.js**: HTTP keep-alive pooling, concurrent workers (up to 100×), cipher caching, buffer pooling
-- **.NET**: AesGcm reuse, ArrayPool, SocketsHttpHandler, Task concurrent workers
-- **Java**: ACCP provider, Cipher instance reuse, ThreadLocal pools
-
-#### Running Comprehensive Benchmarks
-
-Use the included benchmark script to test all server/client combinations:
-
-```bash
-# Run full benchmark suite (default 1000 iterations, 5 runs)
-./benchmark.sh
-
-# Custom iterations
-./benchmark.sh 500
-
-# Results saved to benchmark_results_YYYYMMDD_HHMMSS.txt
-```
+- **Go and Rust** are virtually tied at ~3050 req/s with identical P50/P95 latencies
+- **Go** has the best tail latency (P99: 5.6ms, Max: 23.7ms) — no GC pauses or runtime overhead
+- **Rust** has occasional outliers (Max: 56.5ms) but consistent P95/P99
+- **.NET** performs well at 2476 req/s, ~19% behind Go/Rust — AesGcm reuse and ArrayPool optimizations help
+- **Node.js** is the slowest at 2362 req/s, ~23% behind Go/Rust — single-threaded event loop limits throughput
+- **`/transaction/purchase`** is consistently sub-millisecond across all clients (0.5-1.1ms mean) — AES-GCM with cached sessions is very fast
+- **`/session/init`** dominates latency (2.5-3.3ms mean) — ECDH key exchange + HKDF + PostgreSQL/Redis writes
+- All clients achieve **>99% efficiency** (actual vs theoretical throughput), meaning the bottleneck is server-side, not client-side
 
 ## Development
 

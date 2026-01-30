@@ -25,6 +25,48 @@ const fastify: FastifyInstance = Fastify({
   trustProxy: true,
 });
 
+// Store request start time for duration calculation
+declare module 'fastify' {
+  interface FastifyRequest {
+    startTime?: number;
+  }
+}
+
+// Request logging hook - log incoming requests
+fastify.addHook('onRequest', async (request) => {
+  request.startTime = Date.now();
+  logger.info('HTTP', `--> ${request.method} ${request.url}`, undefined, undefined, undefined, {
+    method: request.method,
+    url: request.url,
+    clientId: request.headers['x-clientid'] || 'unknown',
+    userAgent: request.headers['user-agent'],
+    ip: request.ip,
+  });
+});
+
+// Response logging hook - log outgoing responses
+fastify.addHook('onResponse', async (request, reply) => {
+  const duration = request.startTime ? Date.now() - request.startTime : 0;
+  
+  if (reply.statusCode >= 400) {
+    logger.warn('HTTP', `<-- ${request.method} ${request.url} ${reply.statusCode} ${duration}ms`, undefined, undefined, undefined, undefined, {
+      method: request.method,
+      url: request.url,
+      statusCode: reply.statusCode,
+      durationMs: duration,
+      clientId: request.headers['x-clientid'] || 'unknown',
+    });
+  } else {
+    logger.info('HTTP', `<-- ${request.method} ${request.url} ${reply.statusCode} ${duration}ms`, undefined, undefined, undefined, {
+      method: request.method,
+      url: request.url,
+      statusCode: reply.statusCode,
+      durationMs: duration,
+      clientId: request.headers['x-clientid'] || 'unknown',
+    });
+  }
+});
+
 /**
  * Register plugins
  */
@@ -87,7 +129,14 @@ async function start(): Promise<void> {
 /**
  * Graceful shutdown
  */
+let isShuttingDown = false;
 async function shutdown(signal: string): Promise<void> {
+  if (isShuttingDown) {
+    logger.info('Server', `Shutdown already in progress, ignoring ${signal}`);
+    return;
+  }
+  isShuttingDown = true;
+  
   logger.info('Server', `Received ${signal}, starting graceful shutdown`);
 
   try {
@@ -118,18 +167,19 @@ async function shutdown(signal: string): Promise<void> {
 }
 
 // Register shutdown handlers
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
+// Note: Using void to explicitly handle the promise without blocking
+process.on('SIGTERM', () => { void shutdown('SIGTERM'); });
+process.on('SIGINT', () => { void shutdown('SIGINT'); });
 
 // Handle uncaught errors
 process.on('uncaughtException', error => {
   logger.error('Server', 'Uncaught exception', error);
-  shutdown('uncaughtException');
+  void shutdown('uncaughtException');
 });
 
 process.on('unhandledRejection', (reason) => {
   logger.error('Server', 'Unhandled rejection', reason instanceof Error ? reason : new Error(String(reason)));
-  shutdown('unhandledRejection');
+  void shutdown('unhandledRejection');
 });
 
 // Start the server

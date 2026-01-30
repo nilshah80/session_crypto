@@ -1,12 +1,13 @@
 /**
- * Comprehensive Negative Test Suite for /v1/session/init endpoint
+ * Comprehensive Negative Test Suite for Identity Service Node
  *
  * Test Categories:
- * - Replay Protection
- * - Header Validation
- * - Public Key Validation
- * - TTL Validation
- * - Request Body Validation
+ * - Replay Protection (/v1/session/init)
+ * - Header Validation (/v1/session/init)
+ * - Public Key Validation (/v1/session/init)
+ * - TTL Validation (/v1/session/init)
+ * - Request Body Validation (/v1/session/init)
+ * - Get Session Key Validation (/v1/session/:sessionId)
  */
 
 import * as crypto from 'crypto';
@@ -924,10 +925,221 @@ async function testRedisFallback(): Promise<TestResult[]> {
   return results;
 }
 
+async function makeGetSessionRequest(
+  sessionId: string,
+  clientId?: string
+): Promise<{ status: number; body: any; headers: any }> {
+  const headers: Record<string, string> = {};
+  if (clientId) {
+    headers['X-ClientId'] = clientId;
+  }
+
+  const options = {
+    hostname: BASE_URL,
+    port: PORT,
+    path: `/v1/session/${sessionId}`,
+    method: 'GET',
+    headers,
+  };
+
+  return new Promise((resolve, reject) => {
+    const req = http.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try {
+          resolve({
+            status: res.statusCode || 500,
+            body: JSON.parse(data),
+            headers: res.headers,
+          });
+        } catch (e) {
+          resolve({
+            status: res.statusCode || 500,
+            body: data,
+            headers: res.headers,
+          });
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+async function testGetSessionKeyValidation(): Promise<TestResult[]> {
+  const results: TestResult[] = [];
+
+  console.log('\n=== Get Session Key Validation Tests ===\n');
+
+  // Test 1: Missing X-ClientId header
+  try {
+    const res = await makeGetSessionRequest('S-00000000000000000000000000000000');
+
+    results.push({
+      name: 'Missing X-ClientId header',
+      passed: res.status === 400,
+      expected: '400 (Bad Request)',
+      actual: `${res.status}`,
+      error: res.status !== 400 ? JSON.stringify(res.body) : undefined,
+    });
+  } catch (error: any) {
+    results.push({
+      name: 'Missing X-ClientId header',
+      passed: false,
+      expected: '400',
+      actual: 'Exception thrown',
+      error: error.message,
+    });
+  }
+
+  // Test 2: Invalid session ID format (missing prefix)
+  try {
+    const res = await makeGetSessionRequest('00000000000000000000000000000000', 'test-client');
+
+    results.push({
+      name: 'Invalid session ID format (missing S- prefix)',
+      passed: res.status === 400,
+      expected: '400 (Bad Request)',
+      actual: `${res.status}`,
+      error: res.status !== 400 ? JSON.stringify(res.body) : undefined,
+    });
+  } catch (error: any) {
+    results.push({
+      name: 'Invalid session ID format (missing S- prefix)',
+      passed: false,
+      expected: '400',
+      actual: 'Exception thrown',
+      error: error.message,
+    });
+  }
+
+  // Test 3: Invalid session ID format (too short)
+  try {
+    const res = await makeGetSessionRequest('S-abc123', 'test-client');
+
+    results.push({
+      name: 'Invalid session ID format (too short)',
+      passed: res.status === 400,
+      expected: '400 (Bad Request)',
+      actual: `${res.status}`,
+      error: res.status !== 400 ? JSON.stringify(res.body) : undefined,
+    });
+  } catch (error: any) {
+    results.push({
+      name: 'Invalid session ID format (too short)',
+      passed: false,
+      expected: '400',
+      actual: 'Exception thrown',
+      error: error.message,
+    });
+  }
+
+  // Test 4: Invalid session ID format (invalid characters)
+  try {
+    const res = await makeGetSessionRequest('S-ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ', 'test-client');
+
+    results.push({
+      name: 'Invalid session ID format (invalid hex characters)',
+      passed: res.status === 400,
+      expected: '400 (Bad Request)',
+      actual: `${res.status}`,
+      error: res.status !== 400 ? JSON.stringify(res.body) : undefined,
+    });
+  } catch (error: any) {
+    results.push({
+      name: 'Invalid session ID format (invalid hex characters)',
+      passed: false,
+      expected: '400',
+      actual: 'Exception thrown',
+      error: error.message,
+    });
+  }
+
+  // Test 5: Non-existent session
+  try {
+    const res = await makeGetSessionRequest('S-00000000000000000000000000000000', 'test-client');
+
+    results.push({
+      name: 'Non-existent session',
+      passed: res.status === 404,
+      expected: '404 (Not Found)',
+      actual: `${res.status}`,
+      error: res.status !== 404 ? JSON.stringify(res.body) : undefined,
+    });
+  } catch (error: any) {
+    results.push({
+      name: 'Non-existent session',
+      passed: false,
+      expected: '404',
+      actual: 'Exception thrown',
+      error: error.message,
+    });
+  }
+
+  // Test 6: Unauthorized client (different clientId)
+  try {
+    const { publicKey } = generateECDHKeyPair();
+    const { key: idempotencyKey } = generateIdempotencyKey();
+    const ownerClientId = 'owner-client-' + crypto.randomBytes(8).toString('hex');
+    const attackerClientId = 'attacker-client-' + crypto.randomBytes(8).toString('hex');
+
+    // Create session with owner client
+    const createRes = await makeSessionInitRequest(publicKey, idempotencyKey, ownerClientId, 900);
+    if (createRes.status !== 200) {
+      throw new Error(`Failed to create session: ${createRes.status}`);
+    }
+
+    // Try to access with different client
+    const getRes = await makeGetSessionRequest(createRes.body.sessionId, attackerClientId);
+
+    results.push({
+      name: 'Unauthorized client access (different clientId)',
+      passed: getRes.status === 403,
+      expected: '403 (Forbidden)',
+      actual: `${getRes.status}`,
+      error: getRes.status !== 403 ? JSON.stringify(getRes.body) : undefined,
+    });
+  } catch (error: any) {
+    results.push({
+      name: 'Unauthorized client access (different clientId)',
+      passed: false,
+      expected: '403',
+      actual: 'Exception thrown',
+      error: error.message,
+    });
+  }
+
+  // Test 7: Empty session ID
+  try {
+    const res = await makeGetSessionRequest('', 'test-client');
+
+    // Empty path segment might result in different behavior
+    results.push({
+      name: 'Empty session ID',
+      passed: res.status === 400 || res.status === 404,
+      expected: '400 or 404',
+      actual: `${res.status}`,
+      error: (res.status !== 400 && res.status !== 404) ? JSON.stringify(res.body) : undefined,
+    });
+  } catch (error: any) {
+    results.push({
+      name: 'Empty session ID',
+      passed: false,
+      expected: '400 or 404',
+      actual: 'Exception thrown',
+      error: error.message,
+    });
+  }
+
+  return results;
+}
+
 // Main test runner
 async function runAllTests() {
   console.log('╔════════════════════════════════════════════════════════════════╗');
-  console.log('║   Negative Test Suite for /v1/session/init Endpoint           ║');
+  console.log('║   Negative Test Suite for Identity Service Node               ║');
   console.log('╚════════════════════════════════════════════════════════════════╝');
 
   const allResults: TestResult[] = [];
@@ -939,6 +1151,7 @@ async function runAllTests() {
   allResults.push(...await testTTLValidation());
   allResults.push(...await testRequestBodyValidation());
   allResults.push(...await testRedisFallback());
+  allResults.push(...await testGetSessionKeyValidation());
 
   // Print summary
   console.log('\n╔════════════════════════════════════════════════════════════════╗');

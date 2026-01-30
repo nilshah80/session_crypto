@@ -77,3 +77,17 @@ export interface SessionRow {
   expires_at: Date;
   created_at: Date;
 }
+
+/**
+ * Response from GET /v1/session/:sessionId endpoint
+ */
+export interface SessionKeyResponse {
+  /** Session ID */
+  sessionId: string;
+
+  /** Session key (base64 encoded) */
+  sessionKey: string;
+
+  /** Expiration timestamp (Unix milliseconds) */
+  expiresAt: number;
+}

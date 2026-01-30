@@ -96,16 +96,8 @@ export class SessionRepositoryImpl extends BaseRepositoryImpl implements Session
         return null;
       }
 
-      // Check if session has expired
-      const now = new Date();
-      if (row.expires_at && row.expires_at < now) {
-        logger.debug('SessionRepository', 'Session expired', undefined, { sessionId });
-        // Clean up expired session
-        await this.deleteSession(sessionId);
-        return null;
-      }
-
-      // Map row columns to SessionData and include expiration
+      // Return session data - expiry check is handled by the service layer
+      // Expired session cleanup is handled by the session cleanup job
       return {
         data: this.mapRowToEntity(row),
         expiresAt: row.expires_at,
