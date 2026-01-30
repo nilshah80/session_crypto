@@ -6,6 +6,8 @@ import { config } from './config';
 import { registerRoutes } from './routes';
 import { databaseService } from './services/database.service';
 import { cacheService } from './services/cache.service';
+import { requestValidationService } from './services/request-validation.service';
+import { sessionCleanupJob } from './jobs/session-cleanup.job';
 import { sessionRepository } from './repositories';
 import { logger } from './utils/logger';
 
@@ -68,6 +70,9 @@ async function start(): Promise<void> {
     // Initialize application
     await initialize();
 
+    // Start session cleanup job
+    sessionCleanupJob.start();
+
     // Start listening
     await fastify.listen({
       port: config.PORT,
@@ -89,6 +94,12 @@ async function shutdown(signal: string): Promise<void> {
     // Stop accepting new connections
     await fastify.close();
     logger.info('Server', 'Fastify closed');
+
+    // Stop session cleanup job
+    await sessionCleanupJob.stop();
+
+    // Dispose request validation service (cleanup memory nonce store)
+    requestValidationService.dispose();
 
     // Close cache connection
     await cacheService.close();
@@ -116,10 +127,8 @@ process.on('uncaughtException', error => {
   shutdown('uncaughtException');
 });
 
-process.on('unhandledRejection', (reason, promise) => {
-  logger.error('Server', 'Unhandled rejection', reason, undefined, undefined, undefined, {
-    promise: promise.toString(),
-  });
+process.on('unhandledRejection', (reason) => {
+  logger.error('Server', 'Unhandled rejection', reason instanceof Error ? reason : new Error(String(reason)));
   shutdown('unhandledRejection');
 });
 

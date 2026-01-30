@@ -31,4 +31,12 @@ export interface SessionRepository extends BaseRepository {
    * Ensure sessions table exists (for initialization)
    */
   ensureSessionsTable(): Promise<void>;
+
+  /**
+   * Cleanup expired sessions in batches
+   * @param batchSize Number of sessions to delete per batch
+   * @param batchDelayMs Delay between batches in milliseconds
+   * @returns Total number of deleted sessions
+   */
+  cleanupExpired(batchSize: number, batchDelayMs: number): Promise<number>;
 }

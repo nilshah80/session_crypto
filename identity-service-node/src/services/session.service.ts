@@ -36,7 +36,7 @@ export class SessionService {
   ): Promise<SessionInitResponse> {
     // 1. Validate replay protection (timestamp + nonce)
     const { timestamp, nonce } = requestValidationService.parseIdempotencyKey(idempotencyKey);
-    await requestValidationService.validateTimestampAndNonce(timestamp, nonce);
+    await requestValidationService.validateTimestampAndNonce(timestamp, nonce, clientId);
 
     // 2. Validate and parse client public key
     const clientPublicKeyBytes = unb64(body.clientPublicKey);

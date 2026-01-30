@@ -45,11 +45,10 @@ export class SessionRepositoryImpl extends BaseRepositoryImpl implements Session
     expiresAt: Date
   ): Promise<void> {
     try {
-      await this.query(
+      const result = await this.query(
         `INSERT INTO sessions (session_id, session_key, session_type, client_id, principal, expires_at)
          VALUES ($1, $2, $3, $4, $5, $6)
-         ON CONFLICT (session_id) DO UPDATE
-         SET session_key = $2, session_type = $3, client_id = $4, principal = $5, expires_at = $6`,
+         ON CONFLICT (session_id) DO NOTHING`,
         [
           sessionId,
           sessionData.key,
@@ -59,6 +58,14 @@ export class SessionRepositoryImpl extends BaseRepositoryImpl implements Session
           expiresAt,
         ]
       );
+
+      if ((result.rowCount ?? 0) === 0) {
+        // Session ID collision - CSPRNG failure or impossible coincidence
+        logger.error('SessionRepository', 'Session ID collision detected - possible CSPRNG failure', undefined, undefined, undefined, undefined, {
+          sessionId,
+        });
+        throw new Error('SESSION_ID_COLLISION');
+      }
 
       logger.debug('SessionRepository', 'Session created', undefined, { sessionId });
     } catch (error) {
@@ -132,6 +139,43 @@ export class SessionRepositoryImpl extends BaseRepositoryImpl implements Session
       });
       throw error;
     }
+  }
+
+  /**
+   * Cleanup expired sessions in batches
+   * Based on identity-service token.repository.impl.ts cleanupExpired pattern
+   */
+  async cleanupExpired(batchSize: number, batchDelayMs: number): Promise<number> {
+    let totalDeleted = 0;
+    let deleted = 0;
+
+    do {
+      const result = await this.query(
+        `DELETE FROM sessions WHERE session_id IN (
+          SELECT session_id FROM sessions
+          WHERE expires_at < CURRENT_TIMESTAMP
+          LIMIT $1
+        )`,
+        [batchSize]
+      );
+
+      deleted = result.rowCount || 0;
+      totalDeleted += deleted;
+
+      if (deleted > 0) {
+        logger.debug('SessionRepository', 'Cleaned expired sessions batch', undefined, {
+          batchDeleted: deleted,
+          totalDeleted,
+        });
+      }
+
+      // Small delay between batches to avoid resource exhaustion
+      if (deleted === batchSize) {
+        await new Promise(resolve => setTimeout(resolve, batchDelayMs));
+      }
+    } while (deleted === batchSize);
+
+    return totalDeleted;
   }
 
   /**

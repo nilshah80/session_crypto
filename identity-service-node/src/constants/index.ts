@@ -46,6 +46,12 @@ export const CACHE = {
 
   /** Redis connection timeout in milliseconds (5 seconds) */
   REDIS_CONNECTION_TIMEOUT_MS: 5000,
+
+  /** Memory nonce cleanup interval in milliseconds (60 seconds) */
+  MEMORY_NONCE_CLEANUP_INTERVAL_MS: 60000,
+
+  /** Maximum size for in-memory nonce store (fail-closed when exceeded) */
+  MEMORY_NONCE_MAX_SIZE: 50000,
 } as const;
 
 // ============================================================================

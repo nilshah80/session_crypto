@@ -93,8 +93,23 @@ export const config: Config = {
   // Cache Configuration
   CACHE_LRU_MAX_TTL_SECONDS: getEnvNumber('CACHE_LRU_MAX_TTL_SECONDS', 600), // 10 minutes
 
+  // Session Cleanup Job Configuration
+  SESSION_CLEANUP_INTERVAL_MS: getEnvNumber('SESSION_CLEANUP_INTERVAL_MS', 3600000), // 1 hour
+  SESSION_CLEANUP_BATCH_SIZE: getEnvNumber('SESSION_CLEANUP_BATCH_SIZE', 1000),
+  SESSION_CLEANUP_BATCH_DELAY_MS: getEnvNumber('SESSION_CLEANUP_BATCH_DELAY_MS', 100),
+  SESSION_CLEANUP_WARNING_THRESHOLD_MS: getEnvNumber('SESSION_CLEANUP_WARNING_THRESHOLD_MS', 30000), // 30 seconds
+
   // HTTP Server Timeouts
   CONNECTION_TIMEOUT_MS: getEnvNumber('CONNECTION_TIMEOUT_MS', 30000), // 30 seconds
   REQUEST_TIMEOUT_MS: getEnvNumber('REQUEST_TIMEOUT_MS', 60000), // 60 seconds
   BODY_LIMIT_BYTES: getEnvNumber('BODY_LIMIT_BYTES', 1048576), // 1 MB
 };
+
+// Validate replay protection configuration
+// Nonce TTL must be >= 2× timestamp window to prevent replay after nonce expiry
+if (config.REPLAY_NONCE_TTL_SEC < 2 * config.REPLAY_TIMESTAMP_WINDOW_SEC) {
+  throw new Error(
+    `REPLAY_NONCE_TTL_SEC (${config.REPLAY_NONCE_TTL_SEC}) must be >= 2 × REPLAY_TIMESTAMP_WINDOW_SEC (${config.REPLAY_TIMESTAMP_WINDOW_SEC}). ` +
+    `Required minimum: ${2 * config.REPLAY_TIMESTAMP_WINDOW_SEC}`
+  );
+}

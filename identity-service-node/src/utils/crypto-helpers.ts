@@ -1,5 +1,6 @@
 import * as crypto from 'crypto';
 import { CRYPTO } from '../constants';
+import { logger } from './logger';
 
 /**
  * Crypto utility functions for ECDH key exchange, HKDF key derivation,
@@ -168,7 +169,11 @@ export function validateP256PublicKey(publicKeyBytes: Buffer): void {
     if (keyObject.asymmetricKeyType !== 'ec') {
       throw new Error('INVALID_KEY_TYPE');
     }
-  } catch {
+  } catch (error) {
+    logger.warn('CryptoHelpers', 'P-256 public key validation failed', undefined, undefined, undefined, undefined, {
+      error: (error as Error).message,
+      keyLength: publicKeyBytes.length,
+    });
     throw new Error('POINT_NOT_ON_CURVE');
   }
 }

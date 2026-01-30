@@ -250,6 +250,38 @@ async function testReplayProtection(): Promise<TestResult[]> {
     });
   }
 
+  // Test 5: Same nonce, different clients (should BOTH succeed - nonces are per-client)
+  try {
+    const { publicKey: pk1 } = generateECDHKeyPair();
+    const { publicKey: pk2 } = generateECDHKeyPair();
+    const timestamp = Date.now();
+    const sharedNonce = crypto.randomBytes(16).toString('hex');
+    const idempotencyKey = `${timestamp}.${sharedNonce}`;
+
+    // First client with this nonce
+    const res1 = await makeSessionInitRequest(pk1, idempotencyKey, 'client-A-unique', 900);
+
+    // Different client with SAME nonce should succeed (nonces scoped per-client)
+    const res2 = await makeSessionInitRequest(pk2, idempotencyKey, 'client-B-unique', 900);
+
+    results.push({
+      name: 'Same nonce, different clients (both succeed)',
+      passed: res1.status === 200 && res2.status === 200,
+      expected: 'Both: 200 (nonces are per-client)',
+      actual: `Client-A: ${res1.status}, Client-B: ${res2.status}`,
+      error: (res1.status !== 200 || res2.status !== 200) ? 
+        `ClientA: ${JSON.stringify(res1.body)}, ClientB: ${JSON.stringify(res2.body)}` : undefined,
+    });
+  } catch (error: any) {
+    results.push({
+      name: 'Same nonce, different clients (both succeed)',
+      passed: false,
+      expected: 'Both: 200',
+      actual: 'Exception thrown',
+      error: error.message,
+    });
+  }
+
   return results;
 }
 

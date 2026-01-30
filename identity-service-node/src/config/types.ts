@@ -44,6 +44,12 @@ export interface Config {
   // Cache Configuration
   CACHE_LRU_MAX_TTL_SECONDS: number;
 
+  // Session Cleanup Job Configuration
+  SESSION_CLEANUP_INTERVAL_MS: number;
+  SESSION_CLEANUP_BATCH_SIZE: number;
+  SESSION_CLEANUP_BATCH_DELAY_MS: number;
+  SESSION_CLEANUP_WARNING_THRESHOLD_MS: number;
+
   // HTTP Server Timeouts
   CONNECTION_TIMEOUT_MS: number;
   REQUEST_TIMEOUT_MS: number;
