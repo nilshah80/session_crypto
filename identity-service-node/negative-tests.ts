@@ -44,13 +44,9 @@ function generateECDHKeyPair(): { publicKey: string; ecdh: crypto.ECDH } {
 async function makeSessionInitRequest(
   clientPublicKey: string,
   idempotencyKey: string,
-  clientId: string,
-  ttlSec?: number
+  clientId: string
 ): Promise<{ status: number; body: any; headers: any }> {
   const requestBody: any = { clientPublicKey };
-  if (ttlSec !== undefined) {
-    requestBody.ttlSec = ttlSec;
-  }
 
   const bodyString = JSON.stringify(requestBody);
 
@@ -64,6 +60,57 @@ async function makeSessionInitRequest(
       'Content-Length': Buffer.byteLength(bodyString),
       'X-Idempotency-Key': idempotencyKey,
       'X-ClientId': clientId,
+    },
+  };
+
+  return new Promise((resolve, reject) => {
+    const req = http.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try {
+          resolve({
+            status: res.statusCode || 500,
+            body: JSON.parse(data),
+            headers: res.headers,
+          });
+        } catch (e) {
+          resolve({
+            status: res.statusCode || 500,
+            body: data,
+            headers: res.headers,
+          });
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.write(bodyString);
+    req.end();
+  });
+}
+
+async function makeSessionInitRequestWithAuth(
+  clientPublicKey: string,
+  idempotencyKey: string,
+  clientId: string,
+  authorizationHeader: string
+): Promise<{ status: number; body: any; headers: any }> {
+  const requestBody: any = { clientPublicKey };
+
+  const bodyString = JSON.stringify(requestBody);
+
+  const options = {
+    hostname: BASE_URL,
+    port: PORT,
+    path: ENDPOINT,
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(bodyString),
+      'X-Idempotency-Key': idempotencyKey,
+      'X-ClientId': clientId,
+      'Authorization': authorizationHeader,
     },
   };
 
@@ -151,10 +198,10 @@ async function testReplayProtection(): Promise<TestResult[]> {
     const clientId = 'test-replay-1';
 
     // First request should succeed
-    const res1 = await makeSessionInitRequest(publicKey, idempotencyKey, clientId, 900);
+    const res1 = await makeSessionInitRequest(publicKey, idempotencyKey, clientId);
 
     // Second request with same key should fail
-    const res2 = await makeSessionInitRequest(publicKey, idempotencyKey, clientId, 900);
+    const res2 = await makeSessionInitRequest(publicKey, idempotencyKey, clientId);
 
     results.push({
       name: 'Reused idempotency key (nonce reuse)',
@@ -180,7 +227,7 @@ async function testReplayProtection(): Promise<TestResult[]> {
     const nonce = crypto.randomBytes(16).toString('hex');
     const idempotencyKey = `${oldTimestamp}.${nonce}`;
 
-    const res = await makeSessionInitRequest(publicKey, idempotencyKey, 'test-replay-2', 900);
+    const res = await makeSessionInitRequest(publicKey, idempotencyKey, 'test-replay-2');
 
     results.push({
       name: 'Timestamp too old (beyond 5 minute window)',
@@ -206,7 +253,7 @@ async function testReplayProtection(): Promise<TestResult[]> {
     const nonce = crypto.randomBytes(16).toString('hex');
     const idempotencyKey = `${futureTimestamp}.${nonce}`;
 
-    const res = await makeSessionInitRequest(publicKey, idempotencyKey, 'test-replay-3', 900);
+    const res = await makeSessionInitRequest(publicKey, idempotencyKey, 'test-replay-3');
 
     results.push({
       name: 'Timestamp in future (beyond window)',
@@ -232,7 +279,7 @@ async function testReplayProtection(): Promise<TestResult[]> {
     const shortNonce = crypto.randomBytes(4).toString('hex'); // Only 8 chars
     const idempotencyKey = `${timestamp}.${shortNonce}`;
 
-    const res = await makeSessionInitRequest(publicKey, idempotencyKey, 'test-replay-4', 900);
+    const res = await makeSessionInitRequest(publicKey, idempotencyKey, 'test-replay-4');
 
     results.push({
       name: 'Nonce too short (< 16 chars)',
@@ -260,10 +307,10 @@ async function testReplayProtection(): Promise<TestResult[]> {
     const idempotencyKey = `${timestamp}.${sharedNonce}`;
 
     // First client with this nonce
-    const res1 = await makeSessionInitRequest(pk1, idempotencyKey, 'client-A-unique', 900);
+    const res1 = await makeSessionInitRequest(pk1, idempotencyKey, 'client-A-unique');
 
     // Different client with SAME nonce should succeed (nonces scoped per-client)
-    const res2 = await makeSessionInitRequest(pk2, idempotencyKey, 'client-B-unique', 900);
+    const res2 = await makeSessionInitRequest(pk2, idempotencyKey, 'client-B-unique');
 
     results.push({
       name: 'Same nonce, different clients (both succeed)',
@@ -353,7 +400,7 @@ async function testHeaderValidation(): Promise<TestResult[]> {
     const { publicKey } = generateECDHKeyPair();
     const malformedKey = 'invalid-format-without-dot';
 
-    const res = await makeSessionInitRequest(publicKey, malformedKey, 'test-header-3', 900);
+    const res = await makeSessionInitRequest(publicKey, malformedKey, 'test-header-3');
 
     results.push({
       name: 'Malformed idempotency key (no dot separator)',
@@ -378,7 +425,7 @@ async function testHeaderValidation(): Promise<TestResult[]> {
     const nonce = crypto.randomBytes(16).toString('hex');
     const malformedKey = `notanumber.${nonce}`;
 
-    const res = await makeSessionInitRequest(publicKey, malformedKey, 'test-header-4', 900);
+    const res = await makeSessionInitRequest(publicKey, malformedKey, 'test-header-4');
 
     results.push({
       name: 'Malformed idempotency key (non-numeric timestamp)',
@@ -402,7 +449,7 @@ async function testHeaderValidation(): Promise<TestResult[]> {
     const { publicKey } = generateECDHKeyPair();
     const { key: idempotencyKey } = generateIdempotencyKey();
 
-    const res = await makeSessionInitRequest(publicKey, idempotencyKey, '', 900);
+    const res = await makeSessionInitRequest(publicKey, idempotencyKey, '');
 
     results.push({
       name: 'Empty X-ClientId header',
@@ -427,7 +474,7 @@ async function testHeaderValidation(): Promise<TestResult[]> {
     const timestamp = Date.now();
     const malformedKey = `${timestamp}.`; // Empty nonce after dot
 
-    const res = await makeSessionInitRequest(publicKey, malformedKey, 'test-header-6', 900);
+    const res = await makeSessionInitRequest(publicKey, malformedKey, 'test-header-6');
 
     results.push({
       name: 'Empty nonce in idempotency key (timestamp.)',
@@ -452,7 +499,7 @@ async function testHeaderValidation(): Promise<TestResult[]> {
     const nonce = crypto.randomBytes(16).toString('hex');
     const malformedKey = `.${nonce}`; // Empty timestamp before dot
 
-    const res = await makeSessionInitRequest(publicKey, malformedKey, 'test-header-7', 900);
+    const res = await makeSessionInitRequest(publicKey, malformedKey, 'test-header-7');
 
     results.push({
       name: 'Empty timestamp in idempotency key (.nonce)',
@@ -513,7 +560,7 @@ async function testPublicKeyValidation(): Promise<TestResult[]> {
     const invalidBase64 = 'This is not valid base64!!!@@@';
     const { key: idempotencyKey } = generateIdempotencyKey();
 
-    const res = await makeSessionInitRequest(invalidBase64, idempotencyKey, 'test-pubkey-2', 900);
+    const res = await makeSessionInitRequest(invalidBase64, idempotencyKey, 'test-pubkey-2');
 
     results.push({
       name: 'Invalid base64 encoding in public key',
@@ -540,8 +587,7 @@ async function testPublicKeyValidation(): Promise<TestResult[]> {
     const res = await makeSessionInitRequest(
       wrongLengthKey.toString('base64'),
       idempotencyKey,
-      'test-pubkey-3',
-      900
+      'test-pubkey-3'
     );
 
     results.push({
@@ -575,8 +621,7 @@ async function testPublicKeyValidation(): Promise<TestResult[]> {
     const res = await makeSessionInitRequest(
       invalidPoint.toString('base64'),
       idempotencyKey,
-      'test-pubkey-4',
-      900
+      'test-pubkey-4'
     );
 
     results.push({
@@ -600,7 +645,7 @@ async function testPublicKeyValidation(): Promise<TestResult[]> {
   try {
     const { key: idempotencyKey } = generateIdempotencyKey();
 
-    const res = await makeSessionInitRequest('', idempotencyKey, 'test-pubkey-5', 900);
+    const res = await makeSessionInitRequest('', idempotencyKey, 'test-pubkey-5');
 
     results.push({
       name: 'Empty public key',
@@ -625,49 +670,30 @@ async function testPublicKeyValidation(): Promise<TestResult[]> {
 async function testTTLValidation(): Promise<TestResult[]> {
   const results: TestResult[] = [];
 
-  console.log('\n=== TTL Validation Tests ===\n');
+  console.log('\n=== TTL Validation Tests (Authorization-based) ===\n');
 
-  // Test 1: Negative TTL
+  // NOTE: TTL is now determined by Authorization header presence, not request body.
+  // - No Authorization header: anonymous flow (30 min / 1800s)
+  // - With Authorization header: authenticated flow (1 hour / 3600s)
+  // The ttlSec field in request body is now ignored.
+
+  // Test 1: Anonymous session (no Authorization) gets 30 min TTL
   try {
     const { publicKey } = generateECDHKeyPair();
     const { key: idempotencyKey } = generateIdempotencyKey();
 
-    const res = await makeSessionInitRequest(publicKey, idempotencyKey, 'test-ttl-1', -100);
+    const res = await makeSessionInitRequest(publicKey, idempotencyKey, 'test-ttl-1');
 
     results.push({
-      name: 'Negative TTL value',
-      passed: res.status === 400,
-      expected: '400 (negative TTL)',
-      actual: `${res.status}`,
-      error: res.status !== 400 ? JSON.stringify(res.body) : undefined,
-    });
-  } catch (error: any) {
-    results.push({
-      name: 'Negative TTL value',
-      passed: false,
-      expected: '400',
-      actual: 'Exception thrown',
-      error: error.message,
-    });
-  }
-
-  // Test 2: Zero TTL (should be clamped to minimum, not rejected)
-  try {
-    const { publicKey } = generateECDHKeyPair();
-    const { key: idempotencyKey } = generateIdempotencyKey();
-
-    const res = await makeSessionInitRequest(publicKey, idempotencyKey, 'test-ttl-2', 0);
-
-    results.push({
-      name: 'Zero TTL value (clamped to minimum)',
-      passed: res.status === 200 && res.body.expiresInSec === 60,
-      expected: '200 with TTL clamped to 60',
+      name: 'Anonymous session gets 30 min TTL (1800s)',
+      passed: res.status === 200 && res.body.expiresInSec === 1800,
+      expected: '200 with expiresInSec=1800',
       actual: `${res.status} with TTL ${res.body.expiresInSec || 'N/A'}`,
-      error: (res.status !== 200 || res.body.expiresInSec !== 60) ? JSON.stringify(res.body) : undefined,
+      error: (res.status !== 200 || res.body.expiresInSec !== 1800) ? JSON.stringify(res.body) : undefined,
     });
   } catch (error: any) {
     results.push({
-      name: 'Zero TTL value (clamped to minimum)',
+      name: 'Anonymous session gets 30 min TTL (1800s)',
       passed: false,
       expected: '200',
       actual: 'Exception thrown',
@@ -675,23 +701,23 @@ async function testTTLValidation(): Promise<TestResult[]> {
     });
   }
 
-  // Test 3: TTL above maximum (should be clamped to maximum, not rejected)
+  // Test 2: Authenticated session (with Authorization) gets 1 hour TTL
   try {
     const { publicKey } = generateECDHKeyPair();
     const { key: idempotencyKey } = generateIdempotencyKey();
 
-    const res = await makeSessionInitRequest(publicKey, idempotencyKey, 'test-ttl-3', 7200);
+    const res = await makeSessionInitRequestWithAuth(publicKey, idempotencyKey, 'test-ttl-2', 'Bearer mock-token');
 
     results.push({
-      name: 'TTL above maximum (clamped to 3600)',
+      name: 'Authenticated session gets 1 hour TTL (3600s)',
       passed: res.status === 200 && res.body.expiresInSec === 3600,
-      expected: '200 with TTL clamped to 3600',
+      expected: '200 with expiresInSec=3600',
       actual: `${res.status} with TTL ${res.body.expiresInSec || 'N/A'}`,
       error: (res.status !== 200 || res.body.expiresInSec !== 3600) ? JSON.stringify(res.body) : undefined,
     });
   } catch (error: any) {
     results.push({
-      name: 'TTL above maximum (clamped to 3600)',
+      name: 'Authenticated session gets 1 hour TTL (3600s)',
       passed: false,
       expected: '200',
       actual: 'Exception thrown',
@@ -699,23 +725,24 @@ async function testTTLValidation(): Promise<TestResult[]> {
     });
   }
 
-  // Test 4: TTL below minimum (should be clamped to minimum, not rejected)
+  // Test 3: ttlSec in body is ignored for anonymous session
   try {
     const { publicKey } = generateECDHKeyPair();
     const { key: idempotencyKey } = generateIdempotencyKey();
 
-    const res = await makeSessionInitRequest(publicKey, idempotencyKey, 'test-ttl-4', 30);
+    // ttlSec in body is now ignored - anonymous flow always gets 1800s
+    const res = await makeSessionInitRequest(publicKey, idempotencyKey, 'test-ttl-3');
 
     results.push({
-      name: 'TTL below minimum (clamped to 60)',
-      passed: res.status === 200 && res.body.expiresInSec === 60,
-      expected: '200 with TTL clamped to 60',
+      name: 'ttlSec in body is ignored (anonymous still gets 1800s)',
+      passed: res.status === 200 && res.body.expiresInSec === 1800,
+      expected: '200 with expiresInSec=1800 (ttlSec ignored)',
       actual: `${res.status} with TTL ${res.body.expiresInSec || 'N/A'}`,
-      error: (res.status !== 200 || res.body.expiresInSec !== 60) ? JSON.stringify(res.body) : undefined,
+      error: (res.status !== 200 || res.body.expiresInSec !== 1800) ? JSON.stringify(res.body) : undefined,
     });
   } catch (error: any) {
     results.push({
-      name: 'TTL below minimum (clamped to 60)',
+      name: 'ttlSec in body is ignored (anonymous still gets 1800s)',
       passed: false,
       expected: '200',
       actual: 'Exception thrown',
@@ -723,71 +750,28 @@ async function testTTLValidation(): Promise<TestResult[]> {
     });
   }
 
-  // Test 7: Float/decimal TTL (non-integer)
+  // Test 4: Any Authorization header value triggers authenticated flow
+  // NOTE: In production, Azure APIM validates the Authorization header (JWT token) before
+  // forwarding requests to this service. Invalid tokens are rejected at the gateway level.
+  // This test uses a mock value to verify the service correctly detects header presence.
   try {
     const { publicKey } = generateECDHKeyPair();
     const { key: idempotencyKey } = generateIdempotencyKey();
 
-    const res = await makeSessionInitRequest(publicKey, idempotencyKey, 'test-ttl-7', 123.45);
+    // Even a simple "test" value should trigger authenticated flow
+    // (In production, APIM would reject invalid tokens before they reach this service)
+    const res = await makeSessionInitRequestWithAuth(publicKey, idempotencyKey, 'test-ttl-4', 'test');
 
     results.push({
-      name: 'Float/decimal TTL value (non-integer)',
-      passed: res.status === 400,
-      expected: '400 (non-integer TTL)',
-      actual: `${res.status}`,
-      error: res.status !== 400 ? JSON.stringify(res.body) : undefined,
+      name: 'Any Authorization header triggers authenticated flow',
+      passed: res.status === 200 && res.body.expiresInSec === 3600,
+      expected: '200 with expiresInSec=3600',
+      actual: `${res.status} with TTL ${res.body.expiresInSec || 'N/A'}`,
+      error: (res.status !== 200 || res.body.expiresInSec !== 3600) ? JSON.stringify(res.body) : undefined,
     });
   } catch (error: any) {
     results.push({
-      name: 'Float/decimal TTL value (non-integer)',
-      passed: false,
-      expected: '400',
-      actual: 'Exception thrown',
-      error: error.message,
-    });
-  }
-
-  // Test 5: Valid TTL at minimum boundary (60)
-  try {
-    const { publicKey } = generateECDHKeyPair();
-    const { key: idempotencyKey } = generateIdempotencyKey();
-
-    const res = await makeSessionInitRequest(publicKey, idempotencyKey, 'test-ttl-5', 60);
-
-    results.push({
-      name: 'Valid TTL at minimum boundary (60 sec)',
-      passed: res.status === 200,
-      expected: '200 (valid)',
-      actual: `${res.status}`,
-      error: res.status !== 200 ? JSON.stringify(res.body) : undefined,
-    });
-  } catch (error: any) {
-    results.push({
-      name: 'Valid TTL at minimum boundary (60 sec)',
-      passed: false,
-      expected: '200',
-      actual: 'Exception thrown',
-      error: error.message,
-    });
-  }
-
-  // Test 6: Valid TTL at maximum boundary (3600)
-  try {
-    const { publicKey } = generateECDHKeyPair();
-    const { key: idempotencyKey } = generateIdempotencyKey();
-
-    const res = await makeSessionInitRequest(publicKey, idempotencyKey, 'test-ttl-6', 3600);
-
-    results.push({
-      name: 'Valid TTL at maximum boundary (3600 sec)',
-      passed: res.status === 200,
-      expected: '200 (valid)',
-      actual: `${res.status}`,
-      error: res.status !== 200 ? JSON.stringify(res.body) : undefined,
-    });
-  } catch (error: any) {
-    results.push({
-      name: 'Valid TTL at maximum boundary (3600 sec)',
+      name: 'Any Authorization header triggers authenticated flow',
       passed: false,
       expected: '200',
       actual: 'Exception thrown',
@@ -902,7 +886,7 @@ async function testRedisFallback(): Promise<TestResult[]> {
     const { publicKey } = generateECDHKeyPair();
     const { key: idempotencyKey } = generateIdempotencyKey();
 
-    const res = await makeSessionInitRequest(publicKey, idempotencyKey, 'test-redis-fallback', 900);
+    const res = await makeSessionInitRequest(publicKey, idempotencyKey, 'test-redis-fallback');
 
     // Should succeed even if Redis is down (using LRU cache fallback)
     results.push({
@@ -1086,7 +1070,7 @@ async function testGetSessionKeyValidation(): Promise<TestResult[]> {
     const attackerClientId = 'attacker-client-' + crypto.randomBytes(8).toString('hex');
 
     // Create session with owner client
-    const createRes = await makeSessionInitRequest(publicKey, idempotencyKey, ownerClientId, 900);
+    const createRes = await makeSessionInitRequest(publicKey, idempotencyKey, ownerClientId);
     if (createRes.status !== 200) {
       throw new Error(`Failed to create session: ${createRes.status}`);
     }

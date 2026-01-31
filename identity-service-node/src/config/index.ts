@@ -82,9 +82,8 @@ export const config: Config = {
   ),
 
   // Session Configuration
-  SESSION_TTL_MIN_SEC: getEnvNumber('SESSION_TTL_MIN_SEC', 60), // 1 minute
-  SESSION_TTL_MAX_SEC: getEnvNumber('SESSION_TTL_MAX_SEC', 3600), // 1 hour
-  SESSION_TTL_DEFAULT_SEC: getEnvNumber('SESSION_TTL_DEFAULT_SEC', 900), // 15 minutes
+  SESSION_TTL_ANONYMOUS_SEC: getEnvNumber('SESSION_TTL_ANONYMOUS_SEC', 1800), // 30 minutes
+  SESSION_TTL_AUTHENTICATED_SEC: getEnvNumber('SESSION_TTL_AUTHENTICATED_SEC', 3600), // 1 hour
 
   // Replay Protection Configuration
   REPLAY_TIMESTAMP_WINDOW_SEC: getEnvNumber('REPLAY_TIMESTAMP_WINDOW_SEC', 300), // 5 minutes

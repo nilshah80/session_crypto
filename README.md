@@ -421,6 +421,14 @@ BENCHMARK_CONCURRENCY=50 npm start -- --benchmark 50000
 BENCHMARK_CONCURRENCY=100 npm start -- --benchmark 500000
 ```
 
+```powershell
+# Windows PowerShell
+npm start -- --benchmark 1000
+$env:BENCHMARK_CONCURRENCY=25; npm start -- --benchmark 10000
+$env:BENCHMARK_CONCURRENCY=50; npm start -- --benchmark 50000
+$env:BENCHMARK_CONCURRENCY=100; npm start -- --benchmark 500000
+```
+
 **2. HTTP Keep-Alive** - Always enabled automatically
 - Connection pooling with max 100 sockets
 - Eliminates TCP/TLS handshake overhead
@@ -457,6 +465,15 @@ for CONC in 1 10 25 50 100; do
 done
 ```
 
+```powershell
+# Windows PowerShell
+foreach ($CONC in 1, 10, 25, 50, 100) {
+  Write-Host "Testing concurrency: $CONC"
+  $env:BENCHMARK_CONCURRENCY=$CONC; npm start -- --benchmark 5000
+  Start-Sleep -Seconds 5
+}
+```
+
 #### Go Client Concurrency Options
 
 The Go client supports concurrent goroutine workers for high-throughput benchmarking:
@@ -474,6 +491,14 @@ BENCHMARK_CONCURRENCY=50 go run . --benchmark 50000
 
 # 100 workers
 BENCHMARK_CONCURRENCY=100 go run . --benchmark 500000
+```
+
+```powershell
+# Windows PowerShell
+go run . --benchmark 1000
+$env:BENCHMARK_CONCURRENCY=25; go run . --benchmark 10000
+$env:BENCHMARK_CONCURRENCY=50; go run . --benchmark 50000
+$env:BENCHMARK_CONCURRENCY=100; go run . --benchmark 500000
 ```
 
 **2. HTTP Keep-Alive** - Always enabled (Go default)
@@ -519,6 +544,14 @@ BENCHMARK_CONCURRENCY=50 cargo run --release -- --benchmark 50000
 BENCHMARK_CONCURRENCY=100 cargo run --release -- --benchmark 500000
 ```
 
+```powershell
+# Windows PowerShell
+cargo run --release -- --benchmark 1000
+$env:BENCHMARK_CONCURRENCY=25; cargo run --release -- --benchmark 10000
+$env:BENCHMARK_CONCURRENCY=50; cargo run --release -- --benchmark 50000
+$env:BENCHMARK_CONCURRENCY=100; cargo run --release -- --benchmark 500000
+```
+
 **2. HTTP Keep-Alive** - Always enabled via reqwest connection pooling
 - `pool_max_idle_per_host(100)` for high concurrency
 - Automatic connection reuse across workers
@@ -560,6 +593,14 @@ BENCHMARK_CONCURRENCY=50 dotnet run -c Release -- --benchmark 50000
 
 # 100 workers
 BENCHMARK_CONCURRENCY=100 dotnet run -c Release -- --benchmark 500000
+```
+
+```powershell
+# Windows PowerShell
+dotnet run -c Release -- --benchmark 1000
+$env:BENCHMARK_CONCURRENCY=25; dotnet run -c Release -- --benchmark 10000
+$env:BENCHMARK_CONCURRENCY=50; dotnet run -c Release -- --benchmark 50000
+$env:BENCHMARK_CONCURRENCY=100; dotnet run -c Release -- --benchmark 500000
 ```
 
 **2. HTTP Keep-Alive** - Always enabled via SocketsHttpHandler
@@ -607,6 +648,27 @@ for CONC in 1 10 25 50 100; do
 
   sleep 5
 done
+```
+
+```powershell
+# Windows PowerShell
+foreach ($CONC in 1, 10, 25, 50, 100) {
+  Write-Host "=== Testing concurrency: $CONC ==="
+
+  # Node.js
+  $env:BENCHMARK_CONCURRENCY=$CONC; npm start -- --benchmark 5000
+
+  # Go
+  $env:BENCHMARK_CONCURRENCY=$CONC; go run . --benchmark 5000
+
+  # Rust
+  $env:BENCHMARK_CONCURRENCY=$CONC; cargo run --release -- --benchmark 5000
+
+  # .NET
+  $env:BENCHMARK_CONCURRENCY=$CONC; dotnet run -c Release -- --benchmark 5000
+
+  Start-Sleep -Seconds 5
+}
 ```
 
 ### Benchmark Results

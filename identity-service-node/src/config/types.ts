@@ -33,9 +33,8 @@ export interface Config {
   REDIS_RECONNECT_MAX_DELAY_MS: number;
 
   // Session Configuration
-  SESSION_TTL_MIN_SEC: number;
-  SESSION_TTL_MAX_SEC: number;
-  SESSION_TTL_DEFAULT_SEC: number;
+  SESSION_TTL_ANONYMOUS_SEC: number;
+  SESSION_TTL_AUTHENTICATED_SEC: number;
 
   // Replay Protection Configuration
   REPLAY_TIMESTAMP_WINDOW_SEC: number;

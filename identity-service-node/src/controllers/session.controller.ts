@@ -41,7 +41,7 @@ export async function initSession(
     }
 
     // Validate request body
-    const { clientPublicKey, ttlSec } = request.body;
+    const { clientPublicKey } = request.body;
 
     if (!clientPublicKey) {
       logger.warn('SessionController', 'Missing clientPublicKey in body');
@@ -52,15 +52,24 @@ export async function initSession(
       return;
     }
 
+    // Check if Authorization header is present (already validated by APIM)
+    // If present: authenticated flow (1hr TTL)
+    // If absent: anonymous flow (30min TTL)
+    //
+    // SECURITY NOTE: This endpoint relies on Azure APIM to validate the Authorization header.
+    // APIM validates the JWT token before forwarding the request to this service.
+    // If APIM validation fails, the request is rejected at the gateway level.
+    // Therefore, any request reaching this service with an Authorization header
+    // has already been authenticated by APIM.
+    const authorizationHeader = request.headers['authorization'] as string | undefined;
+    const isAuthenticated = !!authorizationHeader;
+
     // Create session
-    const body: SessionInitBody = { clientPublicKey };
-    if (ttlSec !== undefined) {
-      body.ttlSec = ttlSec;
-    }
     const response = await sessionService.createSession(
-      body,
+      { clientPublicKey },
       idempotencyKey,
-      clientId
+      clientId,
+      isAuthenticated
     );
 
     // Set X-Kid header (session ID as key identifier)
@@ -129,15 +138,6 @@ export async function initSession(
       reply.code(400).send({
         error: 'Bad Request',
         message: 'Invalid X-Idempotency-Key format (expected: timestamp.nonce)',
-      });
-      return;
-    }
-
-    if (err.message === 'TTL_INVALID') {
-      logger.warn('SessionController', 'Invalid TTL value', undefined, undefined, undefined, undefined, { error: err.message });
-      reply.code(400).send({
-        error: 'Bad Request',
-        message: 'TTL must be a non-negative integer',
       });
       return;
     }

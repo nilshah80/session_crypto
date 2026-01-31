@@ -9,9 +9,6 @@
 export interface SessionInitBody {
   /** Client's ECDH P-256 public key (base64 encoded, 65 bytes uncompressed) */
   clientPublicKey: string;
-
-  /** Requested session TTL in seconds (clamped to configured min/max) */
-  ttlSec?: number;
 }
 
 /**

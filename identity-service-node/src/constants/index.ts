@@ -98,8 +98,11 @@ export const CRYPTO = {
 // Session Constants
 // ============================================================================
 export const SESSION = {
-  /** Session type for ECDH sessions */
-  TYPE_ECDH: 'ecdh',
+  /** Session type for anonymous ECDH sessions */
+  TYPE_ANONYMOUS: 'anonymous',
+
+  /** Session type for authenticated ECDH sessions */
+  TYPE_AUTHENTICATED: 'authenticated',
 
   /** Encryption algorithm identifier */
   ENCRYPTION_ALGORITHM: 'aes-256-gcm',

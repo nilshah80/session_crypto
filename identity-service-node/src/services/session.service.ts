@@ -24,15 +24,17 @@ import { logger } from '../utils/logger';
 export class SessionService {
   /**
    * Create a new session via ECDH key exchange
-   * @param body Request body with client public key and optional TTL
+   * @param body Request body with client public key
    * @param idempotencyKey Idempotency key (timestamp.nonce)
    * @param clientId Client identifier
+   * @param isAuthenticated Whether the request has a valid Authorization header (authenticated flow)
    * @returns Session init response with server public key and session ID
    */
   async createSession(
     body: SessionInitBody,
     idempotencyKey: string,
-    clientId: string
+    clientId: string,
+    isAuthenticated: boolean
   ): Promise<SessionInitResponse> {
     // 1. Validate replay protection (timestamp + nonce)
     const { timestamp, nonce } = requestValidationService.parseIdempotencyKey(idempotencyKey);
@@ -63,26 +65,23 @@ export class SessionService {
       const info = Buffer.from(`SESSION|A256GCM|${clientId}`, 'utf8');
       sessionKey = hkdf32(sharedSecret, salt, info);
 
-      // 7. Validate and calculate TTL
-      // Reject negative or non-integer TTL values (matches server behavior)
-      if (body.ttlSec !== undefined && (body.ttlSec < 0 || !Number.isInteger(body.ttlSec))) {
-        throw new Error('TTL_INVALID');
-      }
+      // 7. Determine TTL based on authentication status
+      // Anonymous flow (no Authorization header): 30 minutes
+      // Authenticated flow (Authorization header present): 1 hour
+      const ttlSec = isAuthenticated
+        ? config.SESSION_TTL_AUTHENTICATED_SEC
+        : config.SESSION_TTL_ANONYMOUS_SEC;
 
-      // 8. Cap TTL between configured min and max
-      // NOTE: TTL clamping behavior - values outside [SESSION_TTL_MIN_SEC, SESSION_TTL_MAX_SEC]
-      // are silently clamped to the nearest boundary. TTL of 0 is clamped to SESSION_TTL_MIN_SEC.
-      const requestedTtl = body.ttlSec ?? config.SESSION_TTL_DEFAULT_SEC;
-      const ttlSec = Math.max(
-        config.SESSION_TTL_MIN_SEC,
-        Math.min(requestedTtl, config.SESSION_TTL_MAX_SEC)
-      );
+      // 8. Determine session type based on authentication status
+      const sessionType = isAuthenticated
+        ? SESSION.TYPE_AUTHENTICATED
+        : SESSION.TYPE_ANONYMOUS;
 
       // 9. Create session data with expiration
       const expiresAt = Date.now() + ttlSec * 1000;
       const sessionData: SessionData = {
         key: b64(sessionKey),
-        type: SESSION.TYPE_ECDH,
+        type: sessionType,
         expiresAt,
         clientId,
       };

@@ -43,26 +43,29 @@ async function makeSessionInitRequest(
   clientPublicKey: string,
   idempotencyKey: string,
   clientId: string,
-  ttlSec?: number
+  authorizationHeader?: string
 ): Promise<{ status: number; body: any; headers: any }> {
   const requestBody: any = { clientPublicKey };
-  if (ttlSec !== undefined) {
-    requestBody.ttlSec = ttlSec;
-  }
 
   const bodyString = JSON.stringify(requestBody);
+
+  const headers: Record<string, string | number> = {
+    'Content-Type': 'application/json',
+    'Content-Length': Buffer.byteLength(bodyString),
+    'X-Idempotency-Key': idempotencyKey,
+    'X-ClientId': clientId,
+  };
+
+  if (authorizationHeader) {
+    headers['Authorization'] = authorizationHeader;
+  }
 
   const options = {
     hostname: BASE_URL,
     port: PORT,
     path: ENDPOINT,
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Content-Length': Buffer.byteLength(bodyString),
-      'X-Idempotency-Key': idempotencyKey,
-      'X-ClientId': clientId,
-    },
+    headers,
   };
 
   return new Promise((resolve, reject) => {
@@ -191,7 +194,7 @@ function printResults(sessionInitResults: TestResult[], getSessionResults: TestR
 // Session Init Tests
 async function runSessionInitTests(): Promise<TestResult[]> {
   const results: TestResult[] = [];
-  // Test 1: Valid session creation with default TTL
+  // Test 1: Anonymous session (no Authorization header) - 30 min TTL
   try {
     const { publicKey } = generateECDHKeyPair();
     const { key } = generateIdempotencyKey();
@@ -201,45 +204,19 @@ async function runSessionInitTests(): Promise<TestResult[]> {
                    response.body.sessionId &&
                    response.body.serverPublicKey &&
                    response.body.encAlg === 'aes-256-gcm' &&
-                   response.body.expiresInSec > 0 &&
+                   response.body.expiresInSec === 1800 &&
                    response.headers['x-kid'];
 
     results.push({
-      name: 'Valid session with default TTL',
+      name: 'Anonymous session (no Authorization) - 30 min TTL',
       passed,
-      expected: '200 with sessionId, serverPublicKey, encAlg, expiresInSec, X-Kid header',
-      actual: `${response.status} with ${JSON.stringify(response.body)}`,
-      error: passed ? undefined : 'Missing required fields in response',
-    });
-  } catch (error) {
-    results.push({
-      name: 'Valid session with default TTL',
-      passed: false,
-      expected: '200 OK',
-      actual: 'Request failed',
-      error: (error as Error).message,
-    });
-  }
-
-  // Test 2: Valid session with minimum TTL
-  try {
-    const { publicKey } = generateECDHKeyPair();
-    const { key } = generateIdempotencyKey();
-    const response = await makeSessionInitRequest(publicKey, key, 'test-client-2', 300);
-
-    const passed = response.status === 200 &&
-                   response.body.sessionId &&
-                   response.body.expiresInSec === 300;
-
-    results.push({
-      name: 'Valid session with minimum TTL (300s)',
-      passed,
-      expected: '200 with expiresInSec=300',
+      expected: '200 with expiresInSec=1800 (30 min)',
       actual: `${response.status} with expiresInSec=${response.body.expiresInSec}`,
+      error: passed ? undefined : 'Missing required fields or wrong TTL',
     });
   } catch (error) {
     results.push({
-      name: 'Valid session with minimum TTL (300s)',
+      name: 'Anonymous session (no Authorization) - 30 min TTL',
       passed: false,
       expected: '200 OK',
       actual: 'Request failed',
@@ -247,25 +224,25 @@ async function runSessionInitTests(): Promise<TestResult[]> {
     });
   }
 
-  // Test 3: Valid session with maximum TTL
+  // Test 2: Authenticated session (with Authorization header) - 1 hour TTL
   try {
     const { publicKey } = generateECDHKeyPair();
     const { key } = generateIdempotencyKey();
-    const response = await makeSessionInitRequest(publicKey, key, 'test-client-3', 3600);
+    const response = await makeSessionInitRequest(publicKey, key, 'test-client-2', 'Bearer mock-token');
 
     const passed = response.status === 200 &&
                    response.body.sessionId &&
                    response.body.expiresInSec === 3600;
 
     results.push({
-      name: 'Valid session with maximum TTL (3600s)',
+      name: 'Authenticated session (with Authorization) - 1 hour TTL',
       passed,
-      expected: '200 with expiresInSec=3600',
+      expected: '200 with expiresInSec=3600 (1 hour)',
       actual: `${response.status} with expiresInSec=${response.body.expiresInSec}`,
     });
   } catch (error) {
     results.push({
-      name: 'Valid session with maximum TTL (3600s)',
+      name: 'Authenticated session (with Authorization) - 1 hour TTL',
       passed: false,
       expected: '200 OK',
       actual: 'Request failed',
@@ -273,25 +250,55 @@ async function runSessionInitTests(): Promise<TestResult[]> {
     });
   }
 
-  // Test 4: Valid session with custom TTL
+  // Test 3: Anonymous session response contains all required fields
   try {
     const { publicKey } = generateECDHKeyPair();
     const { key } = generateIdempotencyKey();
-    const response = await makeSessionInitRequest(publicKey, key, 'test-client-4', 1800);
+    const response = await makeSessionInitRequest(publicKey, key, 'test-client-3');
 
     const passed = response.status === 200 &&
                    response.body.sessionId &&
-                   response.body.expiresInSec === 1800;
+                   response.body.serverPublicKey &&
+                   response.body.encAlg === 'aes-256-gcm' &&
+                   response.body.expiresInSec > 0;
 
     results.push({
-      name: 'Valid session with custom TTL (1800s)',
+      name: 'Anonymous session response contains all required fields',
       passed,
-      expected: '200 with expiresInSec=1800',
+      expected: '200 with sessionId, serverPublicKey, encAlg, expiresInSec',
+      actual: `${response.status} with ${JSON.stringify(response.body)}`,
+    });
+  } catch (error) {
+    results.push({
+      name: 'Anonymous session response contains all required fields',
+      passed: false,
+      expected: '200 OK',
+      actual: 'Request failed',
+      error: (error as Error).message,
+    });
+  }
+
+  // Test 4: Authenticated session response contains all required fields
+  try {
+    const { publicKey } = generateECDHKeyPair();
+    const { key } = generateIdempotencyKey();
+    const response = await makeSessionInitRequest(publicKey, key, 'test-client-4', 'Bearer mock-token');
+
+    const passed = response.status === 200 &&
+                   response.body.sessionId &&
+                   response.body.serverPublicKey &&
+                   response.body.encAlg === 'aes-256-gcm' &&
+                   response.body.expiresInSec === 3600;
+
+    results.push({
+      name: 'Authenticated session response contains all required fields',
+      passed,
+      expected: '200 with sessionId, serverPublicKey, encAlg, expiresInSec=3600',
       actual: `${response.status} with expiresInSec=${response.body.expiresInSec}`,
     });
   } catch (error) {
     results.push({
-      name: 'Valid session with custom TTL (1800s)',
+      name: 'Authenticated session response contains all required fields',
       passed: false,
       expected: '200 OK',
       actual: 'Request failed',
@@ -490,33 +497,33 @@ async function runGetSessionTests(): Promise<TestResult[]> {
     });
   }
 
-  // Test 3: Verify expiresAt is in the future
+  // Test 3: Verify expiresAt is in the future (anonymous session - 30 min)
   try {
     const { publicKey } = generateECDHKeyPair();
     const { key } = generateIdempotencyKey();
     const clientId = 'test-get-session-3';
 
-    const createRes = await makeSessionInitRequest(publicKey, key, clientId, 900);
+    const createRes = await makeSessionInitRequest(publicKey, key, clientId);
     const getRes = await makeGetSessionRequest(createRes.body.sessionId, clientId);
 
     const now = Date.now();
     const expiresAt = getRes.body.expiresAt;
     const ttlRemaining = Math.floor((expiresAt - now) / 1000);
 
-    // Should have roughly 900 seconds remaining (allowing some tolerance)
+    // Should have roughly 1800 seconds remaining (allowing some tolerance)
     const passed = getRes.status === 200 &&
                    expiresAt > now &&
-                   ttlRemaining > 890 && ttlRemaining <= 900;
+                   ttlRemaining > 1790 && ttlRemaining <= 1800;
 
     results.push({
-      name: 'ExpiresAt is in the future (matches TTL)',
+      name: 'ExpiresAt is in the future (anonymous - 30 min TTL)',
       passed,
-      expected: 'expiresAt ~900 seconds from now',
+      expected: 'expiresAt ~1800 seconds from now',
       actual: `TTL remaining: ${ttlRemaining}s`,
     });
   } catch (error) {
     results.push({
-      name: 'ExpiresAt is in the future (matches TTL)',
+      name: 'ExpiresAt is in the future (anonymous - 30 min TTL)',
       passed: false,
       expected: 'Valid expiresAt',
       actual: 'Request failed',
